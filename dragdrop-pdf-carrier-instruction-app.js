@@ -99,12 +99,8 @@ function ensureColumns(table, cols) {
   for (const [name, type] of Object.entries(cols)) {
     const want = String(name).toLowerCase();
     if (!namesLC.has(want)) {
-      try {
-        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`).run();
-        namesLC.add(want);
-      } catch (e) {
-        if (!/duplicate column name/i.test(String(e))) throw e;
-      }
+      try { db.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`).run(); }
+      catch (e) { if (!/duplicate column name/i.test(String(e))) throw e; }
     }
   }
 }
@@ -129,11 +125,11 @@ const upload = multer({ storage: multer.memoryStorage() });
 // ---------- Helpers ----------
 function clean(s) {
   return (s || "")
-    .replace(/\u00A0/g, " ")              // NBSP -> space
-    .replace(/[‐–—−]/g, "-")              // dashes -> '-'
+    .replace(/\u00A0/g, " ")
+    .replace(/[‐–—−]/g, "-")
     .replace(/[“”]/g, '"')
     .replace(/[’‘]/g, "'")
-    .replace(/[：]/g, ":")                 // fullwidth colon
+    .replace(/[：]/g, ":")
     .replace(/\s+[ \t]/g, " ")
     .replace(/[ \t]+\n/g, "\n")
     .trim();
@@ -155,7 +151,7 @@ function validateAndScore(f) {
   if (f.total_net_kg && f.total_gross_kg && f.total_gross_kg >= f.total_net_kg) score += 10; else warn.push("Totals inconsistent/missing");
   if (has("hs_code") && /\d{6,8}/.test(f.hs_code)) score += 5;
 
-  score = Math.max(5, Math.min(100, score)); // clamp
+  score = Math.max(5, Math.min(100, score));
   return { score, warnings: warn };
 }
 
@@ -164,12 +160,11 @@ function matchAll(re, text) { const out = []; let m; while ((m = re.exec(text)) 
 function normalizeEmailSpaces(s) { return (s || "").replace(/@([^\s]+)/g, (_, rest) => '@' + rest.replace(/\s+/g, '')); }
 function findEmail(line) {
   const cleaned = normalizeEmailSpaces(line || "");
-  // require the address to start with a letter/number (so "-marina..." is rejected)
   const m = cleaned.match(/\b[A-Z0-9][A-Z0-9._%+-]*@[A-Z0-9.-]+\.[A-Z]{2,}\b/i);
   return m ? m[0].replace(/^[.\-_:;]+/, "") : "";
 }
 
-// Grab a value that appears AFTER a label (even if it's on the next line)
+// Grab a value AFTER a label (even on next line)
 function grabNear(labelRe, valueRe, text, windowChars = 120) {
   const m = labelRe.exec(text);
   if (!m) return "";
@@ -179,7 +174,7 @@ function grabNear(labelRe, valueRe, text, windowChars = 120) {
   return mv ? clean(mv[1] ?? mv[0]) : "";
 }
 
-// Grab 1–N lines after a label until a stop word appears
+// Grab N lines after label until stop word
 function grabBlock(labelRe, stopRes, text, maxLines = 8) {
   const m = labelRe.exec(text);
   if (!m) return "";
@@ -187,7 +182,7 @@ function grabBlock(labelRe, stopRes, text, maxLines = 8) {
   const lines = tail.split("\n").map(l => clean(l));
   const out = [];
   for (const line of lines) {
-    if (!line) break; // stop on first blank line
+    if (!line) break;
     if (stopRes.some(r => r.test(line))) break;
     out.push(line);
     if (out.length >= maxLines) break;
@@ -215,17 +210,13 @@ function parseShippingPoint(block) {
   return res;
 }
 
-// Remove unrelated labels/lines from the carrier block
 function sanitizeCarrierToBlock(s) {
   if (!s) return "";
   const DROP = /(Your\s*Partner|Telephone|Phone|Email|Shipment\s*No|Order\s*No|Delivery\s*No|Loading\s*Date|Shipping\s*Point|Street|Postal|City|Country|Way\s*of\s*Forwarding|Delivery\s*Terms|Incoterms)/i;
   const out = [];
   for (const raw of s.split("\n")) {
     const line = clean(raw);
-    if (!line) {
-      if (out.length) break;
-      continue;
-    }
+    if (!line) { if (out.length) break; continue; }
     if (DROP.test(line)) break;
     out.push(line);
     if (out.length > 8) break;
@@ -233,7 +224,6 @@ function sanitizeCarrierToBlock(s) {
   return out.join("\n");
 }
 
-// Parse values that follow explicit labels inside a section block
 function parseLabeledFields(block, labels) {
   const res = {};
   if (!block) return res;
@@ -258,6 +248,36 @@ function parseLabeledFields(block, labels) {
   return res;
 }
 
+// NEW: robust Notify block parser
+function parseNotify(fullText, which = 1) {
+  let address = "", email = "", phone = "";
+  const stop = [/Notify\s*2/i, /Notify\s*1/i, /Goods\s*Information/i, /B\/L/i, /HS\s*Code/i, /KRONOS/i, /Customer/i, /Order/i, /Shipping\s*Point/i];
+
+  // try explicit label (Notify 1 / Notify 2)
+  let block = grabBlock(which === 1 ? /Notify\s*1[.:\-]?\s*/i : /Notify\s*2[.:\-]?\s*/i, stop, fullText, 12);
+
+  // fallbacks that work with the sample PDFs
+  if (!block) {
+    block = which === 1
+      ? match(/Notify[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:MARKS\s*TEXT|NOTIFY\s*2|ORDER\s*No|B\/L|HS\s*CODE|KRONOS|$))/i, fullText)
+      : match(/NOTIFY\s*2[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:PLEASE\s+ISSUE|B\/L|HS\s*CODE|MARKS|KRONOS|$))/i, fullText);
+  }
+
+  if (block) {
+    const lines = block.split("\n").map(l => clean(l)).filter(Boolean);
+    const addr = [];
+    for (const line of lines) {
+      const m = findEmail(line);
+      if (m) { email = m; continue; }
+      if (/Tel\.|Phone|^\+?\d[\d ()/.\-]*$/.test(line)) { phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i,""); continue; }
+      if (/Vat\s*No\./i.test(line)) continue;
+      addr.push(line);
+    }
+    address = addr.join("\n");
+  }
+  return { address, email, phone };
+}
+
 // ---------- Extraction (parallel; OCR with pre-processing) ----------
 async function extractTextFromBuffer(pdfBuffer) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
@@ -268,15 +288,8 @@ async function extractTextFromBuffer(pdfBuffer) {
     execFile(cmd, args, { maxBuffer: 50 * 1024 * 1024 }, (err, out) => res(err ? "" : out.toString("utf8")));
   });
 
-  // pdf-parse
-  const pPdfParse = (async () => {
-    try { const a = await pdfParse(pdfBuffer); return a?.text || ""; } catch { return ""; }
-  })();
-
-  // pdftotext -layout
+  const pPdfParse = (async () => { try { const a = await pdfParse(pdfBuffer); return a?.text || ""; } catch { return ""; } })();
   const pPdftotext = run("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
-
-  // OCR (deskew/denoise)
   const pOCR = (async () => {
     try {
       await run("pdftoppm", ["-r", "300", pdfPath, path.join(os.tmpdir(), "pg"), "-png"]);
@@ -299,10 +312,8 @@ async function extractTextFromBuffer(pdfBuffer) {
   const candidates = [t1, t2, t3].filter(Boolean);
   if (!candidates.length) return "";
 
-  const best = candidates
-    .map(t => ({ t, score: scoreText(t) }))
-    .sort((a, b) => b.score - a.score)[0].t;
-
+  const best = candidates.map(t => ({ t, score: scoreText(t) }))
+                         .sort((a, b) => b.score - a.score)[0].t;
   return best;
 }
 
@@ -321,7 +332,7 @@ function parseFieldsFromText(textRaw) {
   const full = clean(textRaw).replace(/\r/g, "");
   const norm = full.replace(/[\t\f]+/g, " ");
 
-  // Header block (top only)
+  // Header
   const top = full.slice(0, 2000);
   const anchor = top.search(/Your\s*Partner|Telephone|Email/i);
   const headerBlock = anchor >= 0 ? top.slice(Math.max(0, anchor - 80), anchor + 600) : top.slice(0, 600);
@@ -330,7 +341,7 @@ function parseFieldsFromText(textRaw) {
   let shipper_phone  = stripPrefix(grabNear(/(?:Telephone|Phone)[.:\-]?/i, /(\+?[0-9][0-9 ()\/\-]+)/i, headerBlock, 120));
   let shipper_email  = findEmail(grabNear(/Email[.:\-]?/i, /([^\n]+)/i, headerBlock, 140)) || "";
 
-  // IDs & Dates
+  // IDs & dates
   const grabNum = (lab) => grabNear(lab, /([0-9]{4,}[0-9A-Za-z\-]*)/, full, 120) || "";
   const shipment_no = grabNum(/Shipment\s*No\b/i);
   const order_no    = grabNum(/Order\s*No\b/i);
@@ -338,16 +349,11 @@ function parseFieldsFromText(textRaw) {
 
   const grabDate = (lab) => grabNear(lab, /([0-9]{2}[.\-\/][0-9]{2}[.\-\/][0-9]{2,4})/, full, 90) || "";
   const loading_date = grabDate(/Loading\s*Date\b/i);
-
-  // handle both "Sched. Delivery Date" and "Scheduled Delivery Date"
   let scheduled_delivery_date =
     grabDate(/Sched\.?(?:uled)?\s*Delivery\s*Date\b/i) ||
-    (function(){
-      const m = /(Sched\.?(?:uled)?\s*Delivery\s*Date[^\d]{0,30})(\d{2}[.\-\/]\d{2}[.\-\/]\d{2,4})/i.exec(full);
-      return m ? m[2] : "";
-    })();
+    (function(){ const m = /(Sched\.?(?:uled)?\s*Delivery\s*Date[^\d]{0,30})(\d{2}[.\-\/]\d{2}[.\-\/]\d{2,4})/i.exec(full); return m ? m[2] : ""; })();
 
-  // ---------------- Shipping Point & Way/Terms (labeled section preferred) -----------
+  // Shipping Point / Way / Terms
   const spOuter = match(/Shipping\s*Point[\s\S]*?(?=\n\s*(?:Consignee|Delivery\s*Address|Notify|Goods\s*Information|B\/L|HS\s*Code|$))/i, full);
   const lp = parseLabeledFields(spOuter, {
     street:  /^\s*Street\b/i,
@@ -371,7 +377,6 @@ function parseFieldsFromText(textRaw) {
     shipping_city    = shipping_city    || sp.city;
     shipping_country = shipping_country || sp.country;
   }
-  // Clean up “Street” that accidentally swallowed "Way of Forwarding"
   shipping_street = (shipping_street || "").replace(/\bWay\s*of\s*Forwarding.*$/i, "").replace(/^[\s:!•\-]+/, "");
 
   let way_of_forwarding =
@@ -379,7 +384,7 @@ function parseFieldsFromText(textRaw) {
   let delivery_terms =
     stripPrefix(lp.terms || grabNear(/(?:Delivery\s*Terms|Incoterms)/i, /([^\n]+)/i, full, 100) || "");
 
-  // ---------------- Carrier TO (prefer explicit section, then fallback) --------------
+  // Carrier TO
   let carrier_to = "";
   const labelCT = /CARRIER\s+NOTIFICATION\s+TO[:\s]*/i.exec(full);
   if (labelCT) {
@@ -389,7 +394,7 @@ function parseFieldsFromText(textRaw) {
     carrier_to = sanitizeCarrierToBlock(m ? m[1] : "");
   }
 
-  // ---------------- Consignee / Delivery Address -------------------------------------
+  // Consignee
   let consignee_address = "";
   let consignee_block = match(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]*?)\n\s*Customer\s*No/i, full);
   if (!consignee_block) {
@@ -415,21 +420,28 @@ function parseFieldsFromText(textRaw) {
     consignee_address = clean(addr);
   }
 
-  // ---------------- Customer numbers & contact (explicit fields only) ----------------
+  // Customer explicit fields
   const customer_no = match(/Customer\s*No[.:\-]?\s*([^\n]+)/i, full);
   const customer_po = match(/Customer\s*PO\s*No[.:\-]?\s*([^\n]+)/i, full);
-
   let customer_contact = stripPrefix(grabNear(/Customer\s*Contact/i, /([^\n]+)/i, full, 120));
   let customer_phone   = stripPrefix(grabNear(/Customer\s*Phone\s*Number/i, /([^\n]+)/i, full, 80));
   let customer_email   = findEmail(grabNear(/Customer\s*Email/i, /([^\n]+)/i, full, 140)) || "";
-
-  // Business rule: never allow KRONOS email in customer email; never copy shipper phone
   if (/@kronosww\.com$/i.test(customer_email)) customer_email = "";
   if (customer_phone && shipper_phone && onlyDigits(customer_phone) === onlyDigits(shipper_phone)) {
     customer_phone = "";
   }
 
-  // ---------------- Marks / B/L / HS Code -------------------------------------------
+  // Notify 1 & 2 (safe defaults + parser)
+  const n1 = parseNotify(full, 1);
+  const n2 = parseNotify(full, 2);
+  const notify1_address = n1.address || "";
+  const notify1_email   = n1.email   || "";
+  const notify1_phone   = n1.phone   || "";
+  const notify2_address = n2.address || "";
+  const notify2_email   = n2.email   || "";
+  const notify2_phone   = n2.phone   || "";
+
+  // Marks / HS / B/L
   const bl_remarks1 = clean(match(/B\/L\s*REMARKS[.:\-]?\s*([\s\S]*?)(?:\n\s*HS\s*CODE|(?:\n\s*MARKS)|\n\s*KRONOS|$)/i, full));
   const bl_express  = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, full);
   const bl_remarks  = bl_remarks1 || bl_express || "";
@@ -437,7 +449,7 @@ function parseFieldsFromText(textRaw) {
 
   const order_label = match(/ORDER\s*No[.:\-]?\s*([A-Za-z0-9\/-]+)/i, full);
 
-  // ---------------- Totals & items ---------------------------------------------------
+  // Totals & items
   const t = /TOTAL\s*([0-9\.,]+)\s*KG\s*([0-9]+)\s*([0-9\.,]+)\s*KG/i.exec(full);
   const total_net_kg   = t ? parseFloat(t[1].replace(/\./g, "").replace(",", ".")) : null;
   const total_pkgs     = t ? parseInt(t[2], 10) : null;
@@ -457,7 +469,7 @@ function parseFieldsFromText(textRaw) {
     return { product_name, net_kg, gross_kg, pkgs, packaging, pallets };
   });
 
-  // ---------------- PO preference & tidy --------------------------------------------
+  // PO preference & tidy
   const po_no_explicit = match(/PO\s*No[.:\-]?\s*([A-Za-z0-9/ -]+)/i, full);
   const po_no = (order_label || po_no_explicit || customer_po || "").trim();
 
@@ -694,7 +706,6 @@ var $ = function(sel){ return document.querySelector(sel); };
 var statusEl = $("#status");
 var prodWrap = $("#products");
 
-// product card
 function makeProductCard(idx, data){
   data = data || {};
   var div = document.createElement('div');
@@ -719,23 +730,17 @@ function makeProductCard(idx, data){
     +   '<div></div>'
     + '</div>';
   div.innerHTML = html;
-  div.querySelector('button').onclick = function(){ div.remove(); renumberProducts(); };
+  div.querySelector('button').onclick = function(){ div.remove(); var hs = prodWrap.querySelectorAll('.product header strong'); for (var i=0;i<hs.length;i++){ hs[i].textContent = 'Product ' + (i+1); } };
   return div;
-}
-function renumberProducts(){
-  var hs = prodWrap.querySelectorAll('.product header strong');
-  for (var i=0;i<hs.length;i++){ hs[i].textContent = 'Product ' + (i+1); }
 }
 function addProduct(data){ prodWrap.appendChild(makeProductCard(prodWrap.children.length, data)); }
 
-// upload handlers
 var drop = $("#drop"), file = $("#file");
 drop.addEventListener("click", function(){ file.click(); });
 drop.addEventListener("dragover", function(e){ e.preventDefault(); });
 drop.addEventListener("drop", function(e){ e.preventDefault(); handleFiles(e.dataTransfer.files); });
 file.addEventListener("change", function(e){ handleFiles(e.target.files); });
 
-// upload (nocache=1 while iterating)
 async function handleFiles(files){
   var f = files[0]; if (!f) return;
   statusEl.textContent = "Uploading & extracting…";
@@ -905,10 +910,7 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
 
     if (!noCache) {
       const cached = db.prepare("SELECT parsed FROM cache WHERE hash = ?").get(hash);
-      if (cached?.parsed) {
-        const parsed = JSON.parse(cached.parsed);
-        return res.json(parsed);
-      }
+      if (cached?.parsed) return res.json(JSON.parse(cached.parsed));
     }
 
     const text = await extractTextFromBuffer(req.file.buffer);
@@ -933,7 +935,6 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// Debug endpoint
 app.post("/api/debug-text", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file" });
