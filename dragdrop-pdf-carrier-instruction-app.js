@@ -1,20 +1,3 @@
-/**
- * Carrier Notification Letter
- * PDF → Autofill form → Save to SQLite (Render disk)
- * Extraction pipeline: pdf-parse → pdftotext -layout → Tesseract OCR (fallback)
- */
-const crypto = require("crypto");
-
-// cache table (hash of PDF -> raw text + parsed JSON)
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS cache (
-    hash TEXT PRIMARY KEY,
-    text TEXT,
-    parsed TEXT,
-    created_at TEXT
-  )
-`).run();
-
 // ====== REQUIRES ======
 const express = require("express");
 const multer = require("multer");
@@ -34,7 +17,6 @@ const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 
 const db = new Database(DB_PATH);
-// optional but safe:
 try { db.pragma("journal_mode = WAL"); } catch (_) {}
 
 // ====== TABLES ======
@@ -132,6 +114,9 @@ ensureColumns("shipments", {
   notify2_phone: "TEXT"
 });
 ensureColumns("items", { packaging: "TEXT", pallets: "INTEGER" });
+
+// ====== APP SETUP CONTINUES BELOW (routes, parsers, etc.) ======
+
 
 // ====== APP SETUP CONTINUES BELOW (routes, parsers, etc.) ======
 
