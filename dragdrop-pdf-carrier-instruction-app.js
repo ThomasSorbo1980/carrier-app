@@ -15,6 +15,7 @@ db.prepare(`
   )
 `).run();
 
+// ====== REQUIRES ======
 const express = require("express");
 const multer = require("multer");
 const pdfParse = require("pdf-parse");
@@ -25,14 +26,18 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const { execFile } = require("child_process");
+const crypto = require("crypto");
 
-// ---------- DB ----------
+// ====== DB INIT (MUST come before any db.prepare calls) ======
 const DB_PATH = process.env.SQLITE_DB_PATH || "shipments.db";
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
-const db = new Database(DB_PATH);
 
-// Base tables (superset of fields we use)
+const db = new Database(DB_PATH);
+// optional but safe:
+try { db.pragma("journal_mode = WAL"); } catch (_) {}
+
+// ====== TABLES ======
 db.prepare(`
   CREATE TABLE IF NOT EXISTS shipments (
     id TEXT PRIMARY KEY,
@@ -90,7 +95,16 @@ db.prepare(`
   )
 `).run();
 
-// Auto-migrations (case-insensitive column check)
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS cache (
+    hash TEXT PRIMARY KEY,
+    text TEXT,
+    parsed TEXT,
+    created_at TEXT
+  )
+`).run();
+
+// ====== AUTO-MIGRATIONS ======
 function ensureColumns(table, cols) {
   const existing = db.prepare(`PRAGMA table_info(${table})`).all();
   const namesLC = new Set(existing.map(r => String(r.name).toLowerCase()));
@@ -118,6 +132,9 @@ ensureColumns("shipments", {
   notify2_phone: "TEXT"
 });
 ensureColumns("items", { packaging: "TEXT", pallets: "INTEGER" });
+
+// ====== APP SETUP CONTINUES BELOW (routes, parsers, etc.) ======
+
 
 // ---------- App ----------
 const app = express();
