@@ -1,6 +1,6 @@
 /**
  * Carrier Notification Letter
- * PDF → Autofill form → Save to SQLite
+ * PDF → Autofill form → Save to SQLite (Render disk-ready)
  * Extraction pipeline: pdf-parse + pdftotext -layout + Tesseract OCR
  */
 
@@ -17,13 +17,13 @@ const os = require("os");
 const { execFile } = require("child_process");
 const crypto = require("crypto");
 
-// ====== DB INIT (MUST come before any db.prepare calls) ======
+// ====== DB INIT (MUST be before any db.prepare calls) ======
 const DB_PATH = process.env.SQLITE_DB_PATH || "shipments.db";
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 
 const db = new Database(DB_PATH);
-try { db.pragma("journal_mode = WAL"); } catch (_) {}
+try { db.pragma("journal_mode = WAL"); } catch (_){}
 
 // ====== TABLES ======
 db.prepare(`
@@ -49,6 +49,7 @@ db.prepare(`
     carrier_to TEXT,
     consignee_address TEXT,
     customer_no TEXT,
+    vat_no TEXT,
     customer_po TEXT,
     customer_contact TEXT,
     customer_phone TEXT,
@@ -113,7 +114,8 @@ ensureColumns("shipments", {
   notify1_email: "TEXT",
   notify1_phone: "TEXT",
   notify2_email: "TEXT",
-  notify2_phone: "TEXT"
+  notify2_phone: "TEXT",
+  vat_no: "TEXT"
 });
 ensureColumns("items", { packaging: "TEXT", pallets: "INTEGER" });
 
@@ -238,9 +240,7 @@ function parseLabeledFields(block, labels) {
           while (j < lines.length && !lines[j]) j++;
           if (j < lines.length) val = lines[j];
         }
-        for (const other of Object.values(labels)) {
-          val = val.replace(other, "").trim();
-        }
+        for (const other of Object.values(labels)) val = val.replace(other, "").trim();
         res[key] = clean(val);
       }
     }
@@ -248,15 +248,15 @@ function parseLabeledFields(block, labels) {
   return res;
 }
 
-// NEW: robust Notify block parser
+// Notify parser (robust)
 function parseNotify(fullText, which = 1) {
   let address = "", email = "", phone = "";
   const stop = [/Notify\s*2/i, /Notify\s*1/i, /Goods\s*Information/i, /B\/L/i, /HS\s*Code/i, /KRONOS/i, /Customer/i, /Order/i, /Shipping\s*Point/i];
 
-  // try explicit label (Notify 1 / Notify 2)
+  // explicit label
   let block = grabBlock(which === 1 ? /Notify\s*1[.:\-]?\s*/i : /Notify\s*2[.:\-]?\s*/i, stop, fullText, 12);
 
-  // fallbacks that work with the sample PDFs
+  // fallbacks
   if (!block) {
     block = which === 1
       ? match(/Notify[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:MARKS\s*TEXT|NOTIFY\s*2|ORDER\s*No|B\/L|HS\s*CODE|KRONOS|$))/i, fullText)
@@ -270,7 +270,7 @@ function parseNotify(fullText, which = 1) {
       const m = findEmail(line);
       if (m) { email = m; continue; }
       if (/Tel\.|Phone|^\+?\d[\d ()/.\-]*$/.test(line)) { phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i,""); continue; }
-      if (/Vat\s*No\./i.test(line)) continue;
+      if (/Vat\s*No\./i.test(line)) continue; // keep VAT out of address
       addr.push(line);
     }
     address = addr.join("\n");
@@ -278,7 +278,7 @@ function parseNotify(fullText, which = 1) {
   return { address, email, phone };
 }
 
-// ---------- Extraction (parallel; OCR with pre-processing) ----------
+// ---------- Extraction (parallel; OCR also) ----------
 async function extractTextFromBuffer(pdfBuffer) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
   const pdfPath = path.join(tmp, "input.pdf");
@@ -292,13 +292,13 @@ async function extractTextFromBuffer(pdfBuffer) {
   const pPdftotext = run("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
   const pOCR = (async () => {
     try {
-      await run("pdftoppm", ["-r", "300", pdfPath, path.join(os.tmpdir(), "pg"), "-png"]);
-      const tmpDir = fs.readdirSync(os.tmpdir());
-      const pngs = tmpDir.filter(f => /^pg-\d+\.png$/i.test(f)).sort();
+      const ppmPrefix = path.join(tmp, "pg");
+      await run("pdftoppm", ["-r", "300", pdfPath, ppmPrefix, "-png"]);
+      const pngs = fs.readdirSync(tmp).filter(f => /^pg-\d+\.png$/i.test(f)).sort();
       if (!pngs.length) return "";
       let ocrText = "";
       for (const f of pngs) {
-        const inP = path.join(os.tmpdir(), f), outP = path.join(os.tmpdir(), "prep-" + f);
+        const inP = path.join(tmp, f), outP = path.join(tmp, "prep-" + f);
         await run("convert", [inP, "-deskew", "40%", "-strip", "-colorspace", "Gray",
                               "-contrast-stretch", "1%x1%", "-brightness-contrast", "10x15",
                               "-sharpen", "0x1", outP]);
@@ -319,7 +319,7 @@ async function extractTextFromBuffer(pdfBuffer) {
 
 function scoreText(txt) {
   if (!txt) return 0;
-  const keys = ["Shipment", "Order", "Delivery", "Delivery Address", "Notify", "TOTAL", "Way of Forwarding"];
+  const keys = ["Shipment", "Order", "Delivery", "Delivery Address", "Notify", "TOTAL", "Way of Forwarding", "MARKS"];
   const keyHits = keys.reduce((n, k) => n + (txt.includes(k) ? 1 : 0), 0);
   const numbers = (txt.match(/\b\d{5,}\b/g) || []).length;
   const dates = (txt.match(/\b\d{2}[./-]\d{2}[./-]\d{2,4}\b/g) || []).length;
@@ -426,12 +426,19 @@ function parseFieldsFromText(textRaw) {
   let customer_contact = stripPrefix(grabNear(/Customer\s*Contact/i, /([^\n]+)/i, full, 120));
   let customer_phone   = stripPrefix(grabNear(/Customer\s*Phone\s*Number/i, /([^\n]+)/i, full, 80));
   let customer_email   = findEmail(grabNear(/Customer\s*Email/i, /([^\n]+)/i, full, 140)) || "";
+
+  // Guard: never Kronos email / shipper phone as customer
   if (/@kronosww\.com$/i.test(customer_email)) customer_email = "";
   if (customer_phone && shipper_phone && onlyDigits(customer_phone) === onlyDigits(shipper_phone)) {
     customer_phone = "";
   }
 
-  // Notify 1 & 2 (safe defaults + parser)
+  // VAT number (global)
+  let vat_no = "";
+  const vatM = /\bVAT\s*No\.?\s*[:\-]?\s*([A-Z]{1,3}[- ]?\d[\d\- ]{4,})/i.exec(full);
+  if (vatM) vat_no = clean(vatM[1]).replace(/\s+/g, "");
+
+  // Notify 1 & 2
   const n1 = parseNotify(full, 1);
   const n2 = parseNotify(full, 2);
   const notify1_address = n1.address || "";
@@ -441,12 +448,21 @@ function parseFieldsFromText(textRaw) {
   const notify2_email   = n2.email   || "";
   const notify2_phone   = n2.phone   || "";
 
-  // Marks / HS / B/L
+  // MARKS TEXT & LABELLING → B/L remarks
+  const marksBlock = match(/MARKS?\s*TEXT[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:LABELLING|Notify|NOTIFY|B\/L|HS\s*CODE|Goods|KRONOS|$))/i, full);
+  const labellingBlock = match(/LABELLING[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:ORDER\s*No|Notify|NOTIFY|B\/L|HS\s*CODE|KRONOS|$))/i, full);
+
   const bl_remarks1 = clean(match(/B\/L\s*REMARKS[.:\-]?\s*([\s\S]*?)(?:\n\s*HS\s*CODE|(?:\n\s*MARKS)|\n\s*KRONOS|$)/i, full));
   const bl_express  = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, full);
-  const bl_remarks  = bl_remarks1 || bl_express || "";
-  const hs_code     = (match(/HS\s*CODE[.:\-]?\s*([0-9 ]{4,})/i, full) || "").replace(/\s+/g, "");
 
+  const blParts = [];
+  if (bl_remarks1) blParts.push(bl_remarks1);
+  if (bl_express)  blParts.push(bl_express);
+  if (marksBlock)  blParts.push("MARKS TEXT:\n" + clean(marksBlock));
+  if (labellingBlock) blParts.push("LABELLING:\n" + clean(labellingBlock));
+  const bl_remarks  = blParts.join("\n\n").trim();
+
+  const hs_code     = (match(/HS\s*CODE[.:\-]?\s*([0-9 ]{4,})/i, full) || "").replace(/\s+/g, "");
   const order_label = match(/ORDER\s*No[.:\-]?\s*([A-Za-z0-9\/-]+)/i, full);
 
   // Totals & items
@@ -506,6 +522,7 @@ function parseFieldsFromText(textRaw) {
 
     consignee_address,
     customer_no: _customer_no,
+    vat_no,                     // NEW
     customer_po: _customer_po,
 
     customer_contact,
@@ -555,8 +572,9 @@ app.get("/", (_req, res) => {
   .section-title{font-weight:600;border-bottom:1px solid var(--border);padding-bottom:6px;margin:6px 0 12px}
   .muted{color:var(--muted)}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
   .row4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px}
-  .btn{background:var(--pri);color:#fff;border:none;border-radius:8px;padding:12px 14px;cursor:pointer}
+  .btn{display:inline-block;text-decoration:none;text-align:center;background:var(--pri);color:#fff;border:none;border-radius:8px;padding:10px 12px;cursor:pointer}
   .btn-link{color:#2563EB;background:transparent;border:none;cursor:pointer;padding:0;margin:8px 0}
   .drop{border:2px dashed #cbd5e1;border-radius:10px;padding:12px;text-align:center;cursor:pointer}
   .product{background:#F9FAFB;border:1px solid var(--border);border-radius:8px;padding:12px;margin:8px 0}
@@ -628,8 +646,9 @@ app.get("/", (_req, res) => {
   <div class="card">
     <div class="section-title">Consignee</div>
     <textarea id="consignee_address" placeholder="Enter Consignee address"></textarea>
-    <div class="row">
+    <div class="row3">
       <div><label>Customer No.</label><input id="customer_no"/></div>
+      <div><label>VAT No.</label><input id="vat_no" placeholder="EL-094158104"/></div>
       <div><label>Customer PO No.</label><input id="customer_po"/></div>
     </div>
     <div class="row">
@@ -672,7 +691,7 @@ app.get("/", (_req, res) => {
 
   <div class="card">
     <div class="section-title">B/L Remarks & Instructions</div>
-    <textarea id="bl_remarks"></textarea>
+    <textarea id="bl_remarks" placeholder="Marks, Labelling, special instructions will appear here when present in the PDF."></textarea>
     <label style="margin-top:8px">HS Code</label>
     <input id="hs_code"/>
   </div>
@@ -801,6 +820,7 @@ function fillForm(d){
 
   setVal("consignee_address", d.consignee_address);
   setVal("customer_no", d.customer_no);
+  setVal("vat_no", d.vat_no);
   setVal("customer_po", d.customer_po);
   setVal("customer_contact", d.customer_contact);
   setVal("customer_phone", d.customer_phone);
@@ -850,6 +870,7 @@ document.getElementById("submitBtn").onclick = async function(){
 
     consignee_address: $("#consignee_address").value,
     customer_no: $("#customer_no").value,
+    vat_no: $("#vat_no").value,
     customer_po: $("#customer_po").value,
     customer_contact: $("#customer_contact").value,
     customer_phone: $("#customer_phone").value,
@@ -886,11 +907,22 @@ document.getElementById("submitBtn").onclick = async function(){
 };
 
 async function loadRecent(){
-  var r = await fetch("/api/shipments");
-  var rows = await r.json();
-  var h = '<table><thead><tr><th>Created</th><th>Shipment</th><th>Order</th><th>Consignee</th><th>Total Net (kg)</th></tr></thead><tbody>';
-  (rows||[]).forEach(function(s){
-    h += '<tr><td>' + s.created_at + '</td><td>' + (s.shipment_no||'') + '</td><td>' + (s.order_no||'') + '</td><td>' + ((s.consignee_address||'').split('\\n')[0]||'') + '</td><td>' + (s.total_net_kg||'') + '</td></tr>';
+  const r = await fetch("/api/shipments");
+  const rows = await r.json();
+  let h = '<div style="display:flex;gap:8px;margin-bottom:8px">'
+        + '<a class="btn" href="/api/shipments.csv">Download CSV</a>'
+        + '</div>';
+  h += '<table><thead><tr><th>Created</th><th>Shipment</th><th>Order</th><th>Consignee</th><th>Total Net (kg)</th><th></th></tr></thead><tbody>';
+  (rows||[]).forEach(s => {
+    const consignee = ((s.consignee_address||'').split('\\n')[0]||'');
+    h += '<tr>'
+      + '<td>' + s.created_at + '</td>'
+      + '<td>' + (s.shipment_no||'') + '</td>'
+      + '<td>' + (s.order_no||'') + '</td>'
+      + '<td>' + consignee + '</td>'
+      + '<td>' + (s.total_net_kg||'') + '</td>'
+      + '<td><a href="/api/shipment/' + s.id + '" target="_blank" rel="noopener">View</a></td>'
+      + '</tr>';
   });
   h += '</tbody></table>';
   document.querySelector('#recent').innerHTML = h;
@@ -935,6 +967,7 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
   }
 });
 
+// Inspect raw text of a PDF (debug)
 app.post("/api/debug-text", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file" });
@@ -945,6 +978,7 @@ app.post("/api/debug-text", upload.single("file"), async (req, res) => {
   }
 });
 
+// Save a notification
 app.post("/api/save", (req, res) => {
   const s = req.body || {};
   const id = nanoid();
@@ -957,18 +991,18 @@ app.post("/api/save", (req, res) => {
         po_no, order_label,
         shipping_street, shipping_postal, shipping_city, shipping_country,
         way_of_forwarding, delivery_terms, carrier_to, consignee_address,
-        customer_no, customer_po, customer_contact, customer_phone, customer_email,
+        customer_no, vat_no, customer_po, customer_contact, customer_phone, customer_email,
         notify1_address, notify1_email, notify1_phone, notify2_address, notify2_email, notify2_phone,
         total_net_kg, total_gross_kg, total_pkgs,
         bl_remarks, hs_code, signature_name, signature_date
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
       id, created_at, s.your_partner, s.shipper_phone, s.shipper_email,
       s.shipment_no, s.order_no, s.delivery_no, s.loading_date, s.scheduled_delivery_date,
       s.po_no, s.order_label,
       s.shipping_street, s.shipping_postal, s.shipping_city, s.shipping_country,
       s.way_of_forwarding, s.delivery_terms, s.carrier_to, s.consignee_address,
-      s.customer_no, s.customer_po, s.customer_contact, s.customer_phone, s.customer_email,
+      s.customer_no, s.vat_no || null, s.customer_po, s.customer_contact, s.customer_phone, s.customer_email,
       s.notify1_address, s.notify1_email, s.notify1_phone, s.notify2_address, s.notify2_email, s.notify2_phone,
       s.total_net_kg ?? null, s.total_gross_kg ?? null, s.total_pkgs ?? null,
       s.bl_remarks, s.hs_code, s.signature_name, s.signature_date
@@ -996,6 +1030,7 @@ app.post("/api/save", (req, res) => {
   }
 });
 
+// List notifications
 app.get("/api/shipments", (_req, res) => {
   try {
     const rows = db.prepare(`
@@ -1009,6 +1044,35 @@ app.get("/api/shipments", (_req, res) => {
     console.error(e);
     res.status(500).json({ error: "DB failed" });
   }
+});
+
+// Single shipment detail (JSON with items)
+app.get("/api/shipment/:id", (req, res) => {
+  const id = req.params.id;
+  const s = db.prepare("SELECT * FROM shipments WHERE id = ?").get(id);
+  if (!s) return res.status(404).json({ error: "Not found" });
+  const items = db.prepare("SELECT * FROM items WHERE shipment_id = ? ORDER BY rowid").all(id);
+  res.json({ ...s, items });
+});
+
+// CSV export (last 100)
+app.get("/api/shipments.csv", (_req, res) => {
+  const rows = db.prepare(`
+    SELECT created_at, id, shipment_no, order_no, customer_no, po_no, total_net_kg, total_gross_kg, total_pkgs
+    FROM shipments
+    ORDER BY datetime(created_at) DESC
+    LIMIT 100
+  `).all();
+  const head = "created_at,id,shipment_no,order_no,customer_no,po_no,total_net_kg,total_gross_kg,total_pkgs";
+  const csv = [head].concat(
+    rows.map(r => [
+      r.created_at, r.id, r.shipment_no || "", r.order_no || "", r.customer_no || "", r.po_no || "",
+      r.total_net_kg || "", r.total_gross_kg || "", r.total_pkgs || ""
+    ].map(v => '"' + String(v).replace(/"/g,'""') + '"').join(","))
+  ).join("\n");
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", "attachment; filename=shipments.csv");
+  res.send(csv);
 });
 
 // ---------- Start ----------
