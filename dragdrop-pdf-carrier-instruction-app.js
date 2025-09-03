@@ -199,20 +199,25 @@ function parseShippingPoint(block) {
 
 // ------------------ PARSER (more tolerant to label variants) ------------------
 function parseFieldsFromText(textRaw) {
-  const text = clean(textRaw).replace(/\r/g, "");
-  const norm = text.replace(/[\t\f]+/g, " ");
+// IDs (accept "No", "No.", "No:", etc.) and allow line breaks after the label
+const RE_NO    = String.raw`No\.?`;
+const RE_DATE  = String.raw`([0-9]{2}[.\-\/][0-9]{2}[.\-\/][0-9]{2,4})`;
+const takeLine = String.raw`([^\n]+)`;
 
-  // Flexible label patterns (allow ., :, -, optional spaces, case-insensitive)
-  const RE_NO    = String.raw`No\.?`;
-  const RE_DATE  = String.raw`([0-9]{2}[.\-\/][0-9]{2}[.\-\/][0-9]{2,4})`;
-  const takeLine = String.raw`([^\n]+)`;
+const shipment_no = match(new RegExp(`Shipment\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), text) ||
+                    match(/Shipping\s*Note\s*[:\-]\s*([0-9A-Za-z\-]+)/i, text) || "";
 
-  const shipment_no = match(new RegExp(`Shipment\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), norm);
-  const order_no    = match(new RegExp(`Order\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), norm);
-  const delivery_no = match(new RegExp(`Delivery\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), norm);
+const order_no    = match(new RegExp(`Order\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), text) || "";
 
-  const loading_date = match(new RegExp(`Loading\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), norm);
-  const scheduled_delivery_date = match(new RegExp(`Sched(?:uled)?\\s*Delivery\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), norm);
+const delivery_no = match(new RegExp(`Delivery\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), text) || "";
+
+const loading_date = match(new RegExp(`Loading\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), text) ||
+                     match(/Loading\s*Date[.:\-]?\s*([0-9.\/-]+)/i, text) || "";
+
+const scheduled_delivery_date =
+  match(new RegExp(`Sched(?:uled)?\\s*Delivery\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), text) ||
+  match(/Scheduled\s*Delivery\s*Date[.:\-]?\s*([0-9.\/-]+)/i, text) || "";
+
 // NEW: always define these two, tolerate label variants
 const way_of_forwarding =
   match(/Way\s*of\s*Forwarding[.:\-]?\s*([^\n]+?)(?=\s+(?:Delivery\s*Terms|PRODUCT|\n)|$)/i, text) || "";
@@ -220,9 +225,11 @@ const way_of_forwarding =
 const delivery_terms =
   match(/(?:Delivery\s*Terms|Incoterms)[.:\-]?\s*([A-Z0-9 .\-]+)/i, norm) || "";
   const your_partner  = match(/Your\s*Partner[.:\-]?\s*([^\n]+)/i, norm);
-  const shipper_phone = match(/(?:Telephone|Phone)[.:\-]?\s*([^\n]+)/i, norm);
-  const shipper_email = match(/Email[.:\-]?\s*([^\s]+)/i, norm);
+let shipper_phone = match(/(?:Telephone|Phone)[.:\-]?\s*([^\n]+)/i, text);
+shipper_phone = shipper_phone ? shipper_phone.replace(/^[^\d+]+/, "").trim() : "";
 
+let shipper_email = findEmail(match(/Email[.:\-]?\s*([^\n]+)/i, text) || "") ||
+                    findEmail(text.slice(Math.max(0, (text.indexOf("Email")||0) - 30), (text.indexOf("Email")||0) + 120));
   // Carrier TO (generic catch for forwarder blocks; keep Expeditors example)
   let carrier_to = "";
   const carrierBlock = /(Expeditors International GmbH[\s\S]{0,200}?(?:GERMANY|USA|GREECE|NORWAY|[A-Z]{3,}))/i.exec(text);
@@ -233,12 +240,35 @@ const delivery_terms =
   const sp = parseShippingPoint(spBlock);
 
   // Consignee / Delivery Address (support both labels)
-  const consignee_block = match(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:Customer\s*No|Customer\s*PO|Notify|Marks|Way of))/i, text);
-  let consignee_address = "";
-  if (consignee_block) {
-    const ls = consignee_block.split("\n").map(l => clean(l)).filter(Boolean);
-    consignee_address = ls.join("\n");
+// Try the canonical pattern first: from "Delivery Address" to "Customer No."
+let consignee_address = "";
+let consignee_block = match(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]*?)\n\s*Customer\s*No/i, text);
+
+// Fallback: take up to ~8 non-empty lines after "Delivery Address"
+if (!consignee_block) {
+  const m = /(?:Delivery\s*Address|Consignee)[.:\-]?\s*\n([\s\S]{0,400})/i.exec(text);
+  if (m) consignee_block = m[1];
+}
+
+if (consignee_block) {
+  const lines = consignee_block.split("\n").map(l => clean(l)).filter(Boolean);
+
+  // If the first line looks like a PLANT/COMPANY header, drop it.
+  const COMPANY_HINT = /(GMBH|LTD|LLC|INC|AG|G\.?M\.?B\.?H\.?|KRONOS|SCHMIDT|KATOEN|COVESTRO)/i;
+  const addrLines = (lines.length > 1 && COMPANY_HINT.test(lines[0])) ? lines.slice(1) : lines;
+
+  // Heuristic: if what we got still looks like the Shipping Point (contains 'NORDENHAM' or 'LEVERKUSEN'),
+  // try another occurrence of "Delivery Address".
+  let addr = addrLines.join("\n");
+  if (/NORDENHAM|LEVERKUSEN|NIEHL|MOLENKOPF/i.test(addr)) {
+    const all = matchAll(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]{0,300})/gi, text);
+    for (const mm of all) {
+      const candidate = clean(mm[1]).split("\n").map(l=>clean(l)).filter(Boolean).join("\n");
+      if (!/NORDENHAM|LEVERKUSEN|NIEHL|MOLENKOPF/i.test(candidate) && candidate.length > 10) { addr = candidate; break; }
+    }
   }
+  consignee_address = clean(addr);
+}
 
   const customer_no = match(new RegExp(`Customer\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), norm);
   const customer_po = match(/Customer\s*PO\s*No[.:\-]?\s*([^\n]+)/i, norm);
@@ -290,7 +320,8 @@ const hs_code     = (hs_code_raw || "").replace(/\s+/g, "");
 
   // Items (with packaging & pallets); support PE-Bags, Big Bag, Paper Bags
   const itemMatches = matchAll(
-    /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG[\s\S]*?(\d+\s*(?:PE-Bags|Paper Bags|Big Bag).*?)(?:\n(\d+)\s*Pallet)?/gi,
+    /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG[\s\S]*?(\d+\s*(?:PE-Bags|Paper Bags|Big Bag).*?)(?:\n(\d+)\s*Pallets?)?
+/gi,
     text
   );
   const items = itemMatches.map(m => {
