@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: carrier-app
+    env: docker
+    plan: free
+    envVars:
+      - key: SQLITE_DB_PATH
+        value: /data/shipments.db
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
