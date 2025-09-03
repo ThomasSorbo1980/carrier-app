@@ -68,12 +68,21 @@ db.prepare(`
   )
 `).run();
 
-// Safe auto-migrations (add columns if missing)
+// Safe auto-migrations (add columns if missing; case-insensitive check)
 function ensureColumns(table, cols) {
   const existing = db.prepare(`PRAGMA table_info(${table})`).all();
-  const names = new Set(existing.map(r => r.name));
+  const namesLC = new Set(existing.map(r => String(r.name).toLowerCase()));
   for (const [name, type] of Object.entries(cols)) {
-    if (!names.has(name)) db.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`).run();
+    const want = String(name).toLowerCase();
+    if (!namesLC.has(want)) {
+      try {
+        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`).run();
+        namesLC.add(want);
+      } catch (e) {
+        // If another casing of the same column already exists, ignore
+        if (!/duplicate column name/i.test(String(e))) throw e;
+      }
+    }
   }
 }
 ensureColumns("shipments", {
