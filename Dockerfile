@@ -1,22 +1,19 @@
 FROM node:20-bullseye
 
-# build tools for better-sqlite3
-RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+# Build tools + PDF/ OCR utilities
+RUN apt-get update && apt-get install -y \
+  python3 make g++ \
+  poppler-utils \
+  tesseract-ocr \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# install deps
 COPY package*.json ./
 RUN npm install --omit=dev
 
-# copy app
 COPY . .
 
-# don't set PORT here; Render sets it
-# ENV PORT=3000   <-- REMOVE this line
-
-# optional; harmless
+# Do NOT set PORT; Render provides it
 EXPOSE 3000
-
-# app will read process.env.PORT from Render
 CMD ["node","dragdrop-pdf-carrier-instruction-app.js"]
