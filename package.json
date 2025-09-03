@@ -1,17 +1,17 @@
 {
   "name": "carrier-app",
   "version": "1.0.0",
-  "description": "Drag-and-drop carrier PDF -> form -> DB",
-  "main": "dragdrop-pdf-carrier-instruction-app.js",
+  "description": "Drag-and-drop carrier PDF -> form -> Postgres",
+  "main": "server.js",
   "scripts": {
-    "start": "node dragdrop-pdf-carrier-instruction-app.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.0",
     "dayjs": "^1.11.13",
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",
     "nanoid": "^5.0.7",
-    "pdf-parse": "^1.1.1"
+    "pdf-parse": "^1.1.1",
+    "pg": "^8.11.3"
   }
 }
