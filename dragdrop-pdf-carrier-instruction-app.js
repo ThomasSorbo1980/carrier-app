@@ -540,15 +540,38 @@ app.get("/", (_req, res) => {
   drop.addEventListener("drop", e=>{ e.preventDefault(); handleFiles(e.dataTransfer.files); });
   file.addEventListener("change", e=>handleFiles(e.target.files));
 
-  async function handleFiles(files){
+ async function handleFiles(files){
     const f = files[0]; if (!f) return;
     statusEl.textContent = "Uploading & extracting…";
-    const fd = new FormData(); fd.append("file", f);
-    const r = await fetch("/api/upload", { method:"POST", body: fd });
-    const js = await r.json();
-    if(!r.ok){ statusEl.textContent = js.error || "Failed to parse"; return; }
-    statusEl.textContent = "Parsed. Review the form and submit.";
-    fillForm(js);
+
+    try {
+      const fd = new FormData();
+      fd.append("file", f);
+
+      // Timeout safety (3 minutes)
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 180000);
+
+      const r = await fetch("/api/upload", { method: "POST", body: fd, signal: ctrl.signal });
+      clearTimeout(to);
+
+      const raw = await r.text();                   // always read as text first
+      let js;
+      try { js = JSON.parse(raw); }                 // then try to parse JSON
+      catch (e) { js = { error: "Non-JSON response", raw }; }
+
+      if (!r.ok) {
+        statusEl.textContent = js.error || `Upload failed (${r.status})`;
+        console.error("Upload error response:", js.raw || js);
+        return;
+      }
+
+      statusEl.textContent = "Parsed. Review the form and submit.";
+      fillForm(js);
+    } catch (err) {
+      statusEl.textContent = "Network/timeout: " + err.message;
+      console.error(err);
+    }
   }
 
   function setVal(id, val){ const el = document.getElementById(id); if(el) el.value = val || ""; }
@@ -675,8 +698,29 @@ app.get("/", (_req, res) => {
 
 // ---------- API ----------
 app.post("/api/upload", upload.single("file"), async (req, res) => {
-  // ...existing upload handler code...
-});   // ← end of /api/upload
+  try {
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+    // Some browsers send application/octet-stream; accept anything and try to parse.
+    const mt = req.file.mimetype || "";
+    if (!/pdf/i.test(mt)) {
+      console.warn("Upload mimetype wasn't PDF:", mt);
+    }
+
+    const text = await extractTextFromBuffer(req.file.buffer);
+    if (!text || !text.trim()) {
+      return res.status(422).json({ error: "Unable to extract text (try a clearer PDF or use /api/debug-text to see what I read)" });
+    }
+
+    const fields = parseFieldsFromText(text);
+    res.setHeader("Content-Type", "application/json");
+    res.status(200).send(JSON.stringify(fields));
+  } catch (err) {
+    console.error("Upload failed:", err);
+    res.status(500).json({ error: "Server error: " + (err.message || "unknown") });
+  }
+});
+
 
 // PATCH B — DEBUG ENDPOINT (paste here ↓)
 app.post("/api/debug-text", upload.single("file"), async (req, res) => {
