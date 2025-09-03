@@ -113,34 +113,43 @@ const app = express();
 app.use(express.json({ limit: "8mb" }));
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ---------- Extraction helpers ----------
-function clean(s) { return (s || "").replace(/\s+[ \t]/g, " ").replace(/[ \t]+\n/g, "\n").trim(); }
+// ---------- Extraction helpers (robust) ----------
+function clean(s) {
+  return (s || "")
+    .replace(/\u00A0/g, " ")              // NBSP -> space
+    .replace(/[‐-–—−]/g, "-")             // dashes -> '-'
+    .replace(/[“”]/g, '"')
+    .replace(/[’‘]/g, "'")
+    .replace(/[：]/g, ":")                 // fullwidth colon
+    .replace(/\s+[ \t]/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
 function looksGood(txt) {
-  const keys = ["Shipment No.", "Order No.", "Delivery Terms", "Delivery Address", "Notify", "TOTAL"];
-  const hits = keys.filter(k => txt.includes(k)).length;
-  return hits >= 3 && txt.length > 300;
+  const keys = ["shipment", "order", "delivery", "notify", "total"];
+  const low = (txt || "").toLowerCase();
+  return keys.filter(k => low.includes(k)).length >= 3 && txt.length > 300;
 }
 function execToString(cmd, args) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
+    require("child_process").execFile(cmd, args, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
       if (err) return reject(err);
       resolve(stdout.toString("utf8"));
     });
   });
 }
 async function extractTextFromBuffer(pdfBuffer) {
-  // 1) pdf-parse (text layer)
+  // 1) pdf-parse
   try {
     const a = await pdfParse(pdfBuffer);
     if (a?.text && looksGood(a.text)) return a.text;
   } catch (_) {}
 
-  // write temp file for CLI tools
+  // 2) pdftotext -layout
+  const os = require("os"), path = require("path"), fs = require("fs");
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
   const pdfPath = path.join(tmpDir, "in.pdf");
   fs.writeFileSync(pdfPath, pdfBuffer);
-
-  // 2) pdftotext -layout (preserve columns)
   try {
     const txt = await execToString("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
     if (looksGood(txt)) return txt;
@@ -151,23 +160,17 @@ async function extractTextFromBuffer(pdfBuffer) {
     await execToString("pdftoppm", ["-r", "300", pdfPath, path.join(tmpDir, "pg"), "-png"]);
     const pngs = fs.readdirSync(tmpDir).filter(f => f.startsWith("pg-") && f.endsWith(".png")).sort();
     let ocr = "";
-    for (const p of pngs) {
-      ocr += "\n" + await execToString("tesseract", [path.join(tmpDir, p), "stdout", "--psm", "4"]);
-    }
+    for (const p of pngs) ocr += "\n" + await execToString("tesseract", [path.join(tmpDir, p), "stdout", "--psm", "4"]);
     if (ocr.trim().length > 50) return ocr;
   } catch (_) {}
 
   return "";
 }
 
-// ---------- Parse ----------
 function match(re, text, i = 1) { const m = re.exec(text); return m ? clean(m[i]) : ""; }
 function matchAll(re, text) { const out = []; let m; while ((m = re.exec(text)) !== null) out.push(m); return out; }
 
-function normalizeEmailSpaces(s) {
-  // joins accidental spaces after '@' (e.g., "liv ingstonintl.com")
-  return (s || "").replace(/@([^\s]+)/g, (_, rest) => '@' + rest.replace(/\s+/g, ''));
-}
+function normalizeEmailSpaces(s) { return (s || "").replace(/@([^\s]+)/g, (_, rest) => '@' + rest.replace(/\s+/g, '')); }
 function findEmail(line) {
   const cleaned = normalizeEmailSpaces(line);
   const m = cleaned.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
@@ -179,17 +182,13 @@ function parseShippingPoint(block) {
   if (!block) return res;
   const lines = block.split("\n").map(l => clean(l)).filter(Boolean);
   if (!lines.length) return res;
-
-  const last = lines[lines.length - 1];
-  const prev = lines[lines.length - 2] || "";
-  // If last looks like a COUNTRY (mostly letters/spaces/hyphens)
+  const last = lines[lines.length - 1], prev = lines[lines.length - 2] || "";
   if (/^[A-Za-zÄÖÜäöüß\s\-]+$/.test(last) && last.length > 2) {
     res.country = last;
     const m = prev.match(/(\d{3,10})\s+(.+)/);
     if (m) { res.postal = m[1]; res.city = m[2]; }
     res.street = lines.slice(0, -2).join(", ");
   } else {
-    // Try postal+city on last line
     const m = last.match(/(\d{3,10})\s+(.+)/);
     if (m) { res.postal = m[1]; res.city = m[2]; res.street = lines.slice(0, -1).join(", "); }
     else { res.street = lines.join(", "); }
@@ -198,51 +197,56 @@ function parseShippingPoint(block) {
   return res;
 }
 
+// ------------------ PARSER (more tolerant to label variants) ------------------
 function parseFieldsFromText(textRaw) {
-  const text = textRaw.replace(/\r/g, "");
-  const norm = text.replace(/[\t\f]+/g, " ").replace(/ +/g, " ");
+  const text = clean(textRaw).replace(/\r/g, "");
+  const norm = text.replace(/[\t\f]+/g, " ");
 
-  const shipment_no = match(/Shipment No\.\s*([0-9]+)/i, norm);
-  const order_no = match(/Order No\.\s*([0-9]+)/i, norm);
-  const delivery_no = match(/Delivery No\.\s*([0-9]+)/i, norm);
-  const loading_date = match(/Loading Date:\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i, norm);
-  const scheduled_delivery_date = match(/Sched\. Delivery Date:\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i, norm);
-  const way_of_forwarding = match(/Way of Forwarding:\s*([^\n]+?)(?:\s+Delivery Terms:|\s+PRODUCT|\n)/i, text);
-  const delivery_terms = match(/Delivery Terms:\s*([A-Z]+\s+[A-Za-z0-9]+)/i, norm);
-  const your_partner = match(/Your Partner:\s*([^\n]+)/i, text) || match(/Your Partner:\s*([^\n]+)/i, norm);
-  const shipper_phone = match(/Telephone\s*:\s*([^\n]+)/i, text);
-  const shipper_email = match(/Email\s*:\s*([^\s]+)/i, text);
+  // Flexible label patterns (allow ., :, -, optional spaces, case-insensitive)
+  const RE_NO    = String.raw`No\.?`;
+  const RE_DATE  = String.raw`([0-9]{2}[.\-\/][0-9]{2}[.\-\/][0-9]{2,4})`;
+  const takeLine = String.raw`([^\n]+)`;
 
-  // Carrier Notification TO (forwarder block; common brand example)
+  const shipment_no = match(new RegExp(`Shipment\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), norm);
+  const order_no    = match(new RegExp(`Order\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), norm);
+  const delivery_no = match(new RegExp(`Delivery\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), norm);
+
+  const loading_date = match(new RegExp(`Loading\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), norm);
+  const scheduled_delivery_date = match(new RegExp(`Sched(?:uled)?\\s*Delivery\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), norm);
+
+  const your_partner  = match(/Your\s*Partner[.:\-]?\s*([^\n]+)/i, norm);
+  const shipper_phone = match(/(?:Telephone|Phone)[.:\-]?\s*([^\n]+)/i, norm);
+  const shipper_email = match(/Email[.:\-]?\s*([^\s]+)/i, norm);
+
+  // Carrier TO (generic catch for forwarder blocks; keep Expeditors example)
   let carrier_to = "";
-  const forwarderBlock = /(Expeditors International GmbH[\s\S]{0,200}?(?:GERMANY|GREECE|NORWAY|USA|[A-Z]{3,}))/i.exec(text);
-  if (forwarderBlock) carrier_to = clean(forwarderBlock[1]);
+  const carrierBlock = /(Expeditors International GmbH[\s\S]{0,200}?(?:GERMANY|USA|GREECE|NORWAY|[A-Z]{3,}))/i.exec(text);
+  if (carrierBlock) carrier_to = clean(carrierBlock[1]);
 
-  // Shipping Point block
-  const spBlock = match(/Shipping Point:\s*([\s\S]*?)(?=\n\s*(?:Way of Forwarding|Delivery Terms|PRODUCT|Delivery Address):)/i, text);
+  // Shipping Point block (several label variants)
+  const spBlock = match(/Shipping\s*Point(?:\s*address)?[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:Way of Forwarding|Delivery Terms|PRODUCT|Delivery Address|Consignee|Customer))/i, text);
   const sp = parseShippingPoint(spBlock);
 
-  // Consignee (Delivery Address)
-  const consignee_block = match(/Delivery Address:\s*([\s\S]*?)\n\s*Customer No\./i, text);
+  // Consignee / Delivery Address (support both labels)
+  const consignee_block = match(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:Customer\s*No|Customer\s*PO|Notify|Marks|Way of))/i, text);
   let consignee_address = "";
   if (consignee_block) {
-    const lines = consignee_block.split("\n").map(l => clean(l)).filter(Boolean);
-    consignee_address = lines.join("\n");
+    const ls = consignee_block.split("\n").map(l => clean(l)).filter(Boolean);
+    consignee_address = ls.join("\n");
   }
 
-  const customer_no = match(/Customer No\.\s*([^\s]+)/i, text);
-  const customer_po = match(/Customer PO No\.\s*([^\n]+)/i, text);
+  const customer_no = match(new RegExp(`Customer\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), norm);
+  const customer_po = match(/Customer\s*PO\s*No[.:\-]?\s*([^\n]+)/i, norm);
 
   // Notify 1 (address + email + phone)
   let notify1_address = "", notify1_email = "", notify1_phone = "";
-  const notify1_block = match(/Notify:\s*([\s\S]*?)\n\s*(?:MARKS TEXT|NOTIFY\s*2:)/i, text);
+  const notify1_block = match(/Notify[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:MARKS\s*TEXT|NOTIFY\s*2|ORDER\s*No|B\/L|HS\s*CODE|KRONOS|$))/i, text);
   if (notify1_block) {
     const lines = notify1_block.split("\n").map(l => clean(l)).filter(Boolean);
     const addr = [];
     for (const line of lines) {
-      const email = findEmail(line);
-      if (email) { notify1_email = email; continue; }
-      if (/Tel\.|Phone/i.test(line)) { notify1_phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i,""); continue; }
+      const email = findEmail(line); if (email) { notify1_email = email; continue; }
+      if (/Tel\.|Phone/i.test(line)) { notify1_phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i, ""); continue; }
       if (/Vat No\./i.test(line)) continue;
       addr.push(line);
     }
@@ -251,62 +255,58 @@ function parseFieldsFromText(textRaw) {
 
   // Notify 2 (optional)
   let notify2_address = "", notify2_email = "", notify2_phone = "";
-  const notify2_block = match(/NOTIFY\s*2:\s*([\s\S]*?)(?:\n\s*(?:PLEASE ISSUE|B\/L|HS CODE|MARKS|KRONOS|$))/i, text);
+  const notify2_block = match(/NOTIFY\s*2[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:PLEASE\s+ISSUE|B\/L|HS\s*CODE|MARKS|KRONOS|$))/i, text);
   if (notify2_block) {
     const lines = notify2_block.split("\n").map(l => clean(l)).filter(Boolean);
     const addr = [];
     for (const line of lines) {
-      const email = findEmail(line);
-      if (email) { notify2_email = email; continue; }
+      const email = findEmail(line); if (email) { notify2_email = email; continue; }
       if (/Tel\.|Phone|^\+?\d/i.test(line)) { notify2_phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i,""); continue; }
       addr.push(line);
     }
     notify2_address = addr.join("\n");
   }
 
-  // Marks / Order label / B/L / HS Code
-  const bl_remarks1 = clean(match(/B\/L\s*REMARKS:\s*([\s\S]*?)(?:\n\s*HS\s*CODE:|\n\s*MARKS|\n\s*KRONOS|$)/i, text));
-  const bl_express = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, text);
-  const bl_remarks = bl_remarks1 || bl_express || "";
+  // Marks / B/L / HS
+  const bl_remarks1 = clean(match(/B\/L\s*REMARKS[.:\-]?\s*([\s\S]*?)(?:\n\s*HS\s*CODE|(?:\n\s*MARKS)|\n\s*KRONOS|$)/i, text));
+  const bl_express  = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, text);
+  const bl_remarks  = bl_remarks1 || bl_express || "";
 
-  const hs_code_raw = match(/HS\s*CODE\s*:\s*([0-9 ]{4,})/i, text);
-  const hs_code = hs_code_raw.replace(/\s+/g, "");
+  const hs_code_raw = match(/HS\s*CODE[.:\-]?\s*([0-9 ]{4,})/i, text);
+  const hs_code     = hs_code_raw.replace(/\s+/g, "");
 
-  const order_label = match(/ORDER\s*No\s*([A-Za-z0-9\/-]+)/i, text);
+  const order_label = match(/ORDER\s*No[.:\-]?\s*([A-Za-z0-9\/-]+)/i, text);
 
   // Totals
   const t = /TOTAL\s*([0-9\.,]+)\s*KG\s*([0-9]+)\s*([0-9\.,]+)\s*KG/i.exec(text);
-  const total_net_kg = t ? parseFloat(t[1].replace(/\./g, "").replace(",", ".")) : null;
-  const total_pkgs = t ? parseInt(t[2], 10) : null;
+  const total_net_kg   = t ? parseFloat(t[1].replace(/\./g, "").replace(",", ".")) : null;
+  const total_pkgs     = t ? parseInt(t[2], 10) : null;
   const total_gross_kg = t ? parseFloat(t[3].replace(/\./g, "").replace(",", ".")) : null;
 
-  // Items (with packaging & pallets)
+  // Items (with packaging & pallets); support PE-Bags, Big Bag, Paper Bags
   const itemMatches = matchAll(
-    /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG[\s\S]*?(\d+\s*(?:Paper Bags|PE-Bags|Big Bag).*?)(?:\n(\d+)\s*Pallet)?/gi,
+    /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG[\s\S]*?(\d+\s*(?:PE-Bags|Paper Bags|Big Bag).*?)(?:\n(\d+)\s*Pallet)?/gi,
     text
   );
   const items = itemMatches.map(m => {
     const product_name = clean(m[1]);
-    const net_kg = parseFloat(m[2].replace(/\./g, "").replace(",", ".")) || null;
-    const pkgs = parseInt(m[3], 10) || null;
+    const net_kg   = parseFloat(m[2].replace(/\./g, "").replace(",", ".")) || null;
+    const pkgs     = parseInt(m[3], 10) || null;
     const gross_kg = parseFloat(m[4].replace(/\./g, "").replace(",", ".")) || null;
     const packaging = clean(m[5]);
-    const pallets = m[6] ? parseInt(m[6], 10) : null;
+    const pallets   = m[6] ? parseInt(m[6], 10) : null;
     return { product_name, net_kg, gross_kg, pkgs, packaging, pallets };
   });
 
-  // PO number preference: order_label > explicit PO > customer PO
-  const po_no_explicit = match(/PO\s*No\.?:\s*([A-Za-z0-9/ -]+)/i, text);
+  // Prefer order label PO, then explicit, then customer PO
+  const po_no_explicit = match(/PO\s*No[.:\-]?\s*([A-Za-z0-9/ -]+)/i, text);
   const po_no = (order_label || po_no_explicit || customer_po || "").trim();
 
-  // Customer contact (for PDFs that list it separately)
-  let customer_contact = "", customer_phone = "", customer_email = "";
-  const nameBlock = match(/\n([A-Z][A-Z ]{2,})\nPHONE:\s*[^\n]+\nEMAIL:\s*[^\n]+/i, text);
-  if (nameBlock) customer_contact = clean(nameBlock);
-  const phoneLine = match(/PHONE:\s*([^\n]+)/i, text);
-  if (phoneLine) customer_phone = clean(phoneLine);
-  const emailLine = findEmail(match(/EMAIL:\s*([^\n]+)/i, text));
-  if (emailLine) customer_email = clean(emailLine);
+  // Optional customer contact block (e.g., Covestro)
+  let customer_contact = match(/\n([A-Z][A-Z ]{2,})\nPHONE:\s*[^\n]+\nEMAIL:\s*[^\n]+/i, text);
+  customer_contact = clean(customer_contact);
+  let customer_phone = match(/PHONE:\s*([^\n]+)/i, text);
+  let customer_email = findEmail(match(/EMAIL:\s*([^\n]+)/i, text));
 
   return {
     // Header
@@ -326,7 +326,6 @@ function parseFieldsFromText(textRaw) {
     // Goods & extras
     total_net_kg, total_gross_kg, total_pkgs, bl_remarks, hs_code,
     signature_name: "", signature_date: dayjs().format("YYYY-MM-DD"),
-    // Items
     items
   };
 }
@@ -676,15 +675,17 @@ app.get("/", (_req, res) => {
 
 // ---------- API ----------
 app.post("/api/upload", upload.single("file"), async (req, res) => {
+  // ...existing upload handler code...
+});   // ← end of /api/upload
+
+// PATCH B — DEBUG ENDPOINT (paste here ↓)
+app.post("/api/debug-text", upload.single("file"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    if (req.file.mimetype !== "application/pdf") return res.status(400).json({ error: "Only PDF supported" });
-    const text = await extractTextFromBuffer(req.file.buffer);
-    if (!text) return res.status(422).json({ error: "Unable to extract text (try a clearer PDF)" });
-    res.json(parseFieldsFromText(text));
+    if (!req.file) return res.status(400).json({ error: "No file" });
+    const txt = await extractTextFromBuffer(req.file.buffer);
+    res.type("text/plain").send(txt || "(no text extracted)");
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Failed to parse PDF" });
+    res.status(500).json({ error: "debug failed" });
   }
 });
 
