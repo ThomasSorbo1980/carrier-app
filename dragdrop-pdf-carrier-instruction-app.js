@@ -499,202 +499,209 @@ app.get("/", (_req, res) => {
 </div>
 
 <script>
-  const $ = sel => document.querySelector(sel);
-  const statusEl = $("#status");
-  const prodWrap = $("#products");
+// util
+var $ = function(sel){ return document.querySelector(sel); };
+var statusEl = $("#status");
+var prodWrap = $("#products");
 
-  function makeProductCard(idx, data={}){
-    const div = document.createElement("div");
-    div.className = "product";
-    div.innerHTML = \`
-      <header>
-        <strong>Product \${idx+1}</strong>
-        <button class="btn-link" type="button">Remove Product</button>
-      </header>
-      <label>Product Name</label>
-      <input name="product_name" value="\${data.product_name||""}">
-      <div class="row">
-        <div><label>Net Weight (KG)</label><input name="net_kg" value="\${data.net_kg??""}"></div>
-        <div><label>Gross Weight (KG)</label><input name="gross_kg" value="\${data.gross_kg??""}"></div>
-      </div>
-      <div class="row">
-        <div><label>No. Packages</label><input name="pkgs" value="\${data.pkgs??""}"></div>
-        <div><label>Packaging</label><input name="packaging" value="\${data.packaging??""}"></div>
-      </div>
-      <div class="row">
-        <div><label>Pallets</label><input name="pallets" value="\${data.pallets??""}"></div>
-        <div></div>
-      </div>
-    \`;
-    div.querySelector("button").onclick = () => { div.remove(); renumberProducts(); };
-    return div;
-  }
-  function renumberProducts(){
-    [...prodWrap.querySelectorAll(".product header strong")].forEach((h,i)=>h.textContent="Product "+(i+1));
-  }
-  function addProduct(data){ prodWrap.appendChild(makeProductCard(prodWrap.children.length, data)); }
+// product card component (uses ONLY single-quoted strings to avoid nested backticks)
+function makeProductCard(idx, data){
+  data = data || {};
+  var div = document.createElement('div');
+  div.className = 'product';
+  var html = ''
+    + '<header>'
+    +   '<strong>Product ' + (idx+1) + '</strong>'
+    +   '<button class="btn-link" type="button">Remove Product</button>'
+    + '</header>'
+    + '<label>Product Name</label>'
+    + '<input name="product_name" value="' + (data.product_name||'') + '">'
+    + '<div class="row">'
+    +   '<div><label>Net Weight (KG)</label><input name="net_kg" value="' + (data.net_kg||'') + '"></div>'
+    +   '<div><label>Gross Weight (KG)</label><input name="gross_kg" value="' + (data.gross_kg||'') + '"></div>'
+    + '</div>'
+    + '<div class="row">'
+    +   '<div><label>No. Packages</label><input name="pkgs" value="' + (data.pkgs||'') + '"></div>'
+    +   '<div><label>Packaging</label><input name="packaging" value="' + (data.packaging||'') + '"></div>'
+    + '</div>'
+    + '<div class="row">'
+    +   '<div><label>Pallets</label><input name="pallets" value="' + (data.pallets||'') + '"></div>'
+    +   '<div></div>'
+    + '</div>';
+  div.innerHTML = html;
+  div.querySelector('button').onclick = function(){ div.remove(); renumberProducts(); };
+  return div;
+}
+function renumberProducts(){
+  var hs = prodWrap.querySelectorAll('.product header strong');
+  for (var i=0;i<hs.length;i++){ hs[i].textContent = 'Product ' + (i+1); }
+}
+function addProduct(data){ prodWrap.appendChild(makeProductCard(prodWrap.children.length, data)); }
 
-  const drop = $("#drop"), file = $("#file");
-  drop.addEventListener("click", ()=>file.click());
-  drop.addEventListener("dragover", e=>{ e.preventDefault(); });
-  drop.addEventListener("drop", e=>{ e.preventDefault(); handleFiles(e.dataTransfer.files); });
-  file.addEventListener("change", e=>handleFiles(e.target.files));
+// upload handlers
+var drop = $("#drop"), file = $("#file");
+drop.addEventListener("click", function(){ file.click(); });
+drop.addEventListener("dragover", function(e){ e.preventDefault(); });
+drop.addEventListener("drop", function(e){ e.preventDefault(); handleFiles(e.dataTransfer.files); });
+file.addEventListener("change", function(e){ handleFiles(e.target.files); });
 
- async function handleFiles(files){
-    const f = files[0]; if (!f) return;
-    statusEl.textContent = "Uploading & extracting…";
+// hardened upload
+async function handleFiles(files){
+  var f = files[0]; if (!f) return;
+  statusEl.textContent = "Uploading & extracting…";
+  try {
+    var fd = new FormData();
+    fd.append("file", f);
 
-    try {
-      const fd = new FormData();
-      fd.append("file", f);
+    var ctrl = new AbortController();
+    var to = setTimeout(function(){ ctrl.abort(); }, 180000);
 
-      // Timeout safety (3 minutes)
-      const ctrl = new AbortController();
-      const to = setTimeout(() => ctrl.abort(), 180000);
+    var r = await fetch("/api/upload", { method: "POST", body: fd, signal: ctrl.signal });
+    clearTimeout(to);
 
-      const r = await fetch("/api/upload", { method: "POST", body: fd, signal: ctrl.signal });
-      clearTimeout(to);
+    var raw = await r.text();
+    var js;
+    try { js = JSON.parse(raw); } catch(e){ js = { error: "Non-JSON response", raw: raw }; }
 
-      const raw = await r.text();                   // always read as text first
-      let js;
-      try { js = JSON.parse(raw); }                 // then try to parse JSON
-      catch (e) { js = { error: "Non-JSON response", raw }; }
-
-      if (!r.ok) {
-        statusEl.textContent = js.error || `Upload failed (${r.status})`;
-        console.error("Upload error response:", js.raw || js);
-        return;
-      }
-
-      statusEl.textContent = "Parsed. Review the form and submit.";
-      fillForm(js);
-    } catch (err) {
-      statusEl.textContent = "Network/timeout: " + err.message;
-      console.error(err);
+    if (!r.ok) {
+      statusEl.textContent = js.error || ("Upload failed (" + r.status + ")");
+      console.error("Upload error response:", js.raw || js);
+      return;
     }
+
+    statusEl.textContent = "Parsed. Review the form and submit.";
+    fillForm(js);
+  } catch (err) {
+    statusEl.textContent = "Network/timeout: " + err.message;
+    console.error(err);
   }
+}
 
-  function setVal(id, val){ const el = document.getElementById(id); if(el) el.value = val || ""; }
+function setVal(id, val){ var el = document.getElementById(id); if(el) el.value = val || ""; }
 
-  function fillForm(d){
-    setVal("carrier_to", d.carrier_to);
-    setVal("your_partner", d.your_partner);
-    setVal("shipper_phone", d.shipper_phone);
-    setVal("shipper_email", d.shipper_email);
+function fillForm(d){
+  setVal("carrier_to", d.carrier_to);
+  setVal("your_partner", d.your_partner);
+  setVal("shipper_phone", d.shipper_phone);
+  setVal("shipper_email", d.shipper_email);
 
-    setVal("shipment_no", d.shipment_no);
-    setVal("order_no", d.order_no);
-    setVal("delivery_no", d.delivery_no);
-    setVal("loading_date", d.loading_date);
-    setVal("scheduled_delivery_date", d.scheduled_delivery_date);
-    setVal("po_no", d.po_no);
-    setVal("order_label", d.order_label);
+  setVal("shipment_no", d.shipment_no);
+  setVal("order_no", d.order_no);
+  setVal("delivery_no", d.delivery_no);
+  setVal("loading_date", d.loading_date);
+  setVal("scheduled_delivery_date", d.scheduled_delivery_date);
+  setVal("po_no", d.po_no);
+  setVal("order_label", d.order_label);
 
-    setVal("shipping_street", d.shipping_street);
-    setVal("shipping_postal", d.shipping_postal);
-    setVal("shipping_city", d.shipping_city);
-    setVal("shipping_country", d.shipping_country);
+  setVal("shipping_street", d.shipping_street);
+  setVal("shipping_postal", d.shipping_postal);
+  setVal("shipping_city", d.shipping_city);
+  setVal("shipping_country", d.shipping_country);
 
-    setVal("way_of_forwarding", d.way_of_forwarding);
-    setVal("delivery_terms", d.delivery_terms);
+  setVal("way_of_forwarding", d.way_of_forwarding);
+  setVal("delivery_terms", d.delivery_terms);
 
-    setVal("consignee_address", d.consignee_address);
-    setVal("customer_no", d.customer_no);
-    setVal("customer_po", d.customer_po);
-    setVal("customer_contact", d.customer_contact);
-    setVal("customer_phone", d.customer_phone);
-    setVal("customer_email", d.customer_email);
+  setVal("consignee_address", d.consignee_address);
+  setVal("customer_no", d.customer_no);
+  setVal("customer_po", d.customer_po);
+  setVal("customer_contact", d.customer_contact);
+  setVal("customer_phone", d.customer_phone);
+  setVal("customer_email", d.customer_email);
 
-    setVal("notify1_address", d.notify1_address);
-    setVal("notify1_email", d.notify1_email);
-    setVal("notify1_phone", d.notify1_phone);
-    setVal("notify2_address", d.notify2_address);
-    setVal("notify2_email", d.notify2_email);
-    setVal("notify2_phone", d.notify2_phone);
+  setVal("notify1_address", d.notify1_address);
+  setVal("notify1_email", d.notify1_email);
+  setVal("notify1_phone", d.notify1_phone);
+  setVal("notify2_address", d.notify2_address);
+  setVal("notify2_email", d.notify2_email);
+  setVal("notify2_phone", d.notify2_phone);
 
-    setVal("bl_remarks", d.bl_remarks);
-    setVal("hs_code", d.hs_code);
-    setVal("signature_name", d.signature_name);
-    setVal("signature_date", d.signature_date || new Date().toISOString().slice(0,10));
+  setVal("bl_remarks", d.bl_remarks);
+  setVal("hs_code", d.hs_code);
+  setVal("signature_name", d.signature_name);
+  setVal("signature_date", d.signature_date || new Date().toISOString().slice(0,10));
 
-    prodWrap.innerHTML = "";
-    (d.items?.length ? d.items : [{},{}]).forEach(it => addProduct(it));
-    loadRecent();
-  }
+  prodWrap.innerHTML = "";
+  var items = (d.items && d.items.length) ? d.items : [{},{}];
+  for (var i=0;i<items.length;i++) addProduct(items[i]);
+  loadRecent();
+}
 
-  document.getElementById("addProduct").onclick = () => addProduct({});
-  document.getElementById("submitBtn").onclick = async () => {
-    const body = {
-      carrier_to: $("#carrier_to").value,
-      your_partner: $("#your_partner").value,
-      shipper_phone: $("#shipper_phone").value,
-      shipper_email: $("#shipper_email").value,
+document.getElementById("addProduct").onclick = function(){ addProduct({}); };
+document.getElementById("submitBtn").onclick = async function(){
+  var body = {
+    carrier_to: $("#carrier_to").value,
+    your_partner: $("#your_partner").value,
+    shipper_phone: $("#shipper_phone").value,
+    shipper_email: $("#shipper_email").value,
 
-      shipment_no: $("#shipment_no").value,
-      order_no: $("#order_no").value,
-      delivery_no: $("#delivery_no").value,
-      loading_date: $("#loading_date").value,
-      scheduled_delivery_date: $("#scheduled_delivery_date").value,
-      po_no: $("#po_no").value,
-      order_label: $("#order_label").value,
+    shipment_no: $("#shipment_no").value,
+    order_no: $("#order_no").value,
+    delivery_no: $("#delivery_no").value,
+    loading_date: $("#loading_date").value,
+    scheduled_delivery_date: $("#scheduled_delivery_date").value,
+    po_no: $("#po_no").value,
+    order_label: $("#order_label").value,
 
-      shipping_street: $("#shipping_street").value,
-      shipping_postal: $("#shipping_postal").value,
-      shipping_city: $("#shipping_city").value,
-      shipping_country: $("#shipping_country").value,
+    shipping_street: $("#shipping_street").value,
+    shipping_postal: $("#shipping_postal").value,
+    shipping_city: $("#shipping_city").value,
+    shipping_country: $("#shipping_country").value,
 
-      way_of_forwarding: $("#way_of_forwarding").value,
-      delivery_terms: $("#delivery_terms").value,
+    way_of_forwarding: $("#way_of_forwarding").value,
+    delivery_terms: $("#delivery_terms").value,
 
-      consignee_address: $("#consignee_address").value,
-      customer_no: $("#customer_no").value,
-      customer_po: $("#customer_po").value,
-      customer_contact: $("#customer_contact").value,
-      customer_phone: $("#customer_phone").value,
-      customer_email: $("#customer_email").value,
+    consignee_address: $("#consignee_address").value,
+    customer_no: $("#customer_no").value,
+    customer_po: $("#customer_po").value,
+    customer_contact: $("#customer_contact").value,
+    customer_phone: $("#customer_phone").value,
+    customer_email: $("#customer_email").value,
 
-      notify1_address: $("#notify1_address").value,
-      notify1_email: $("#notify1_email").value,
-      notify1_phone: $("#notify1_phone").value,
-      notify2_address: $("#notify2_address").value,
-      notify2_email: $("#notify2_email").value,
-      notify2_phone: $("#notify2_phone").value,
+    notify1_address: $("#notify1_address").value,
+    notify1_email: $("#notify1_email").value,
+    notify1_phone: $("#notify1_phone").value,
+    notify2_address: $("#notify2_address").value,
+    notify2_email: $("#notify2_email").value,
+    notify2_phone: $("#notify2_phone").value,
 
-      bl_remarks: $("#bl_remarks").value,
-      hs_code: $("#hs_code").value,
-      signature_name: $("#signature_name").value,
-      signature_date: $("#signature_date").value,
+    bl_remarks: $("#bl_remarks").value,
+    hs_code: $("#hs_code").value,
+    signature_name: $("#signature_name").value,
+    signature_date: $("#signature_date").value,
 
-      items: [...prodWrap.querySelectorAll(".product")].map(div => ({
+    items: [].map.call(prodWrap.querySelectorAll(".product"), function(div){
+      return {
         product_name: div.querySelector('input[name="product_name"]').value,
         net_kg: parseFloat(div.querySelector('input[name="net_kg"]').value || 0) || null,
         gross_kg: parseFloat(div.querySelector('input[name="gross_kg"]').value || 0) || null,
         pkgs: parseInt(div.querySelector('input[name="pkgs"]').value || 0) || null,
         packaging: div.querySelector('input[name="packaging"]').value || null,
         pallets: parseInt(div.querySelector('input[name="pallets"]').value || 0) || null
-      }))
-    };
-
-    const r = await fetch("/api/save", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
-    const js = await r.json();
-    statusEl.textContent = r.ok ? ("Saved. ID: " + js.id) : (js.error || "Save failed");
-    if (r.ok) loadRecent();
+      };
+    })
   };
 
-  async function loadRecent(){
-    const r = await fetch("/api/shipments");
-    const rows = await r.json();
-    let h = '<table><thead><tr><th>Created</th><th>Shipment</th><th>Order</th><th>Consignee</th><th>Total Net (kg)</th></tr></thead><tbody>';
-    (rows||[]).forEach(s => {
-      h += \`<tr><td>\${s.created_at}</td><td>\${s.shipment_no||""}</td><td>\${s.order_no||""}</td><td>\${(s.consignee_address||"").split("\\n")[0]||""}</td><td>\${s.total_net_kg??""}</td></tr>\`;
-    });
-    h += "</tbody></table>";
-    document.querySelector("#recent").innerHTML = h;
-  }
-  document.getElementById("signature_date").value = new Date().toISOString().slice(0,10);
+  var r = await fetch("/api/save", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
+  var js = await r.json();
+  statusEl.textContent = r.ok ? ("Saved. ID: " + js.id) : (js.error || "Save failed");
+  if (r.ok) loadRecent();
+};
+
+async function loadRecent(){
+  var r = await fetch("/api/shipments");
+  var rows = await r.json();
+  var h = '<table><thead><tr><th>Created</th><th>Shipment</th><th>Order</th><th>Consignee</th><th>Total Net (kg)</th></tr></thead><tbody>';
+  (rows||[]).forEach(function(s){
+    h += '<tr><td>' + s.created_at + '</td><td>' + (s.shipment_no||'') + '</td><td>' + (s.order_no||'') + '</td><td>' + ((s.consignee_address||'').split('\\n')[0]||'') + '</td><td>' + (s.total_net_kg||'') + '</td></tr>';
+  });
+  h += '</tbody></table>';
+  document.querySelector('#recent').innerHTML = h;
+}
+document.getElementById("signature_date").value = new Date().toISOString().slice(0,10);
 </script>
 </body></html>`);
 });
+
 
 // ---------- API ----------
 app.post("/api/upload", upload.single("file"), async (req, res) => {
