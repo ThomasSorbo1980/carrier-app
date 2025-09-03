@@ -1,7 +1,7 @@
 /**
  * Carrier Notification Letter
- * Drag & drop PDF → Autofill the form (screenshot layout) → Save to SQLite (Render disk)
- * Text extraction pipeline: pdf-parse → pdftotext -layout → Tesseract OCR (fallback)
+ * Drag & drop PDF → Autofill the form → Save to SQLite (Render disk)
+ * Extraction pipeline: pdf-parse → pdftotext -layout → Tesseract OCR (fallback)
  */
 
 const express = require("express");
@@ -21,12 +21,10 @@ const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 const db = new Database(DB_PATH);
 
-// Base table (minimal)
 db.prepare(`
   CREATE TABLE IF NOT EXISTS shipments (
     id TEXT PRIMARY KEY,
     created_at TEXT,
-    // Header
     your_partner TEXT,
     shipper_phone TEXT,
     shipper_email TEXT,
@@ -38,9 +36,7 @@ db.prepare(`
     shipping_point TEXT,
     way_of_forwarding TEXT,
     delivery_terms TEXT,
-    // "Carrier Notification TO" (forwarder)
     carrier_to TEXT,
-    // Consignee & customer
     consignee_address TEXT,
     delivery_no TEXT,
     customer_no TEXT,
@@ -48,14 +44,11 @@ db.prepare(`
     customer_contact TEXT,
     customer_phone TEXT,
     customer_email TEXT,
-    // Notify parties
     notify1_address TEXT,
     notify2_address TEXT,
-    // Goods summary
     total_net_kg REAL,
     total_gross_kg REAL,
     total_pkgs INTEGER,
-    // B/L & extra
     bl_remarks TEXT,
     hs_code TEXT,
     signature_name TEXT,
@@ -75,7 +68,7 @@ db.prepare(`
   )
 `).run();
 
-// Safe auto-migrations (add new columns if missing)
+// Safe auto-migrations (add columns if missing)
 function ensureColumns(table, cols) {
   const existing = db.prepare(`PRAGMA table_info(${table})`).all();
   const names = new Set(existing.map(r => r.name));
@@ -84,19 +77,19 @@ function ensureColumns(table, cols) {
   }
 }
 ensureColumns("shipments", {
-  your_partner: "TEXT",
-  shipper_phone: "TEXT",
-  shipper_email: "TEXT",
-  po_no: "TEXT",
-  carrier_to: "TEXT",
-  customer_contact: "TEXT",
-  customer_phone: "TEXT",
-  customer_email: "TEXT",
-  notify2_address: "TEXT",
-  bl_remarks: "TEXT",
-  hs_code: "TEXT",
-  signature_name: "TEXT",
-  signature_date: "TEXT"
+  Your_partner: "TEXT",
+  Shipper_phone: "TEXT",
+  Shipper_email: "TEXT",
+  PO_no: "TEXT",
+  Carrier_to: "TEXT",
+  Customer_contact: "TEXT",
+  Customer_phone: "TEXT",
+  Customer_email: "TEXT",
+  Notify2_address: "TEXT",
+  Bl_remarks: "TEXT",
+  Hs_code: "TEXT",
+  Signature_name: "TEXT",
+  Signature_date: "TEXT"
 });
 
 const app = express();
@@ -165,12 +158,10 @@ function parseFieldsFromText(textRaw) {
   const shipper_phone = match(/Telephone\s*:\s*([^\n]+)/i, text);
   const shipper_email = match(/Email\s*:\s*([^\s]+)/i, text);
 
-  // "Carrier Notification TO" – try to grab a forwarder block (Expeditors…)
   let carrier_to = "";
   const forwarderBlock = /(Expeditors International GmbH[\s\S]{0,200}?(?:GERMANY|GREECE|NORWAY|[A-Z]{3,}))/i.exec(text);
   if (forwarderBlock) carrier_to = clean(forwarderBlock[1]);
 
-  // Consignee (Delivery Address block until "Customer No.")
   const consignee_block = match(/Delivery Address:\s*([\s\S]*?)\n\s*Customer No\./i, text);
   let consignee_address = "";
   if (consignee_block) {
@@ -180,7 +171,6 @@ function parseFieldsFromText(textRaw) {
   const customer_no = match(/Customer No\.\s*([^\s]+)/i, text);
   const customer_po = match(/Customer PO No\.\s*([^\n]+)/i, text);
 
-  // Notify (use up to "MARKS TEXT")
   const notify_block = match(/Notify:\s*([\s\S]*?)\n\s*MARKS TEXT/i, text);
   let notify1_address = "";
   if (notify_block) {
@@ -191,17 +181,14 @@ function parseFieldsFromText(textRaw) {
     notify1_address = lines.join("\n");
   }
 
-  // B/L remarks & order label (marks)
   const bl_remarks = clean(match(/LABELLING:\s*([\s\S]*?)\n\s*ORDER/i, text));
   const order_label = match(/ORDER\s*No\s*([A-Za-z0-9\/-]+)/i, text);
 
-  // Totals
   const t = /TOTAL\s*([0-9\.,]+)\s*KG\s*([0-9]+)\s*([0-9\.,]+)\s*KG/i.exec(text);
   const total_net_kg = t ? parseFloat(t[1].replace(/\./g, "").replace(",", ".")) : null;
   const total_pkgs = t ? parseInt(t[2], 10) : null;
   const total_gross_kg = t ? parseFloat(t[3].replace(/\./g, "").replace(",", ".")) : null;
 
-  // Items → Product cards (name, net, gross, pkgs)
   const itemMatches = matchAll(
     /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG/gi,
     text
@@ -214,34 +201,25 @@ function parseFieldsFromText(textRaw) {
     return { product_name, net_kg, gross_kg, pkgs };
   });
 
-  // Decide PO No: prefer order_label, fallback to customer_po
   const po_no = order_label || customer_po || "";
 
   return {
-    // Header
     your_partner, shipper_phone, shipper_email,
     shipment_no, order_no, loading_date, scheduled_delivery_date, po_no,
-    shipping_point: "", // let user fill; parsing varies
+    shipping_point: "",
     way_of_forwarding: clean(way_of_forwarding), delivery_terms: clean(delivery_terms),
-    // Carrier Notification TO
     carrier_to: clean(carrier_to),
-    // Consignee & customer
     consignee_address: clean(consignee_address),
     delivery_no, customer_no, customer_po,
     customer_contact: "", customer_phone: "", customer_email: "",
-    // Notify parties
-    notify1_address: clean(notify1_address),
-    notify2_address: "",
-    // Goods
+    notify1_address: clean(notify1_address), notify2_address: "",
     total_net_kg, total_gross_kg, total_pkgs,
-    // B/L & extras
     bl_remarks, hs_code: "", signature_name: "", signature_date: dayjs().format("YYYY-MM-DD"),
-    // Products
     items
   };
 }
 
-// ---------- UI (matches your screenshot layout) ----------
+// ---------- UI ----------
 app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="en">
@@ -289,7 +267,7 @@ app.get("/", (_req, res) => {
       </div>
       <div>
         <div class="section-title">CARRIER NOTIFICATION TO:</div>
-        <textarea id="carrier_to" placeholder="Expeditors International GmbH\nMönchhofallee 10\n65479 RAUNHEIM\nGERMANY"></textarea>
+        <textarea id="carrier_to" placeholder="Expeditors International GmbH&#10;Mönchhofallee 10&#10;65479 RAUNHEIM&#10;GERMANY"></textarea>
       </div>
     </div>
 
@@ -387,7 +365,6 @@ app.get("/", (_req, res) => {
   const statusEl = $("#status");
   const prodWrap = $("#products");
 
-  // product card component
   function makeProductCard(idx, data={}){
     const div = document.createElement("div");
     div.className = "product";
@@ -407,8 +384,7 @@ app.get("/", (_req, res) => {
         <div></div>
       </div>
     \`;
-    const removeBtn = div.querySelector("button");
-    removeBtn.onclick = () => { div.remove(); renumberProducts(); };
+    div.querySelector("button").onclick = () => { div.remove(); renumberProducts(); };
     return div;
   }
   function renumberProducts(){
@@ -416,7 +392,6 @@ app.get("/", (_req, res) => {
   }
   function addProduct(data){ prodWrap.appendChild(makeProductCard(prodWrap.children.length, data)); }
 
-  // Upload handlers
   const drop = $("#drop"), file = $("#file");
   drop.addEventListener("click", ()=>file.click());
   drop.addEventListener("dragover", e=>{ e.preventDefault(); });
@@ -467,14 +442,12 @@ app.get("/", (_req, res) => {
     setVal("signature_name", d.signature_name);
     setVal("signature_date", d.signature_date || new Date().toISOString().slice(0,10));
 
-    // products
     prodWrap.innerHTML = "";
-    (d.items || [{},{}]).forEach(it => addProduct(it)); // show at least 2 product cards
+    (d.items || [{},{}]).forEach(it => addProduct(it));
     loadRecent();
   }
 
   $("#addProduct").onclick = () => addProduct({});
-
   $("#submitBtn").onclick = async () => {
     const body = {
       carrier_to: $("#carrier_to").value,
@@ -529,9 +502,8 @@ app.get("/", (_req, res) => {
       h += \`<tr><td>\${s.created_at}</td><td>\${s.shipment_no||""}</td><td>\${s.order_no||""}</td><td>\${(s.consignee_address||"").split("\\n")[0]||""}</td><td>\${s.total_net_kg??""}</td></tr>\`;
     });
     h += "</tbody></table>";
-    $("#recent").innerHTML = h;
+    document.querySelector("#recent").innerHTML = h;
   }
-  // Initial state
   fillForm({ signature_date: new Date().toISOString().slice(0,10) });
 </script>
 </body></html>`);
