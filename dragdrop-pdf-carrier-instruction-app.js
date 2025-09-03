@@ -318,22 +318,20 @@ const hs_code     = (hs_code_raw || "").replace(/\s+/g, "");
   const total_pkgs     = t ? parseInt(t[2], 10) : null;
   const total_gross_kg = t ? parseFloat(t[3].replace(/\./g, "").replace(",", ".")) : null;
 
-  // Items (with packaging & pallets); support PE-Bags, Big Bag, Paper Bags
-  const itemMatches = matchAll(
-    /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG[\s\S]*?(\d+\s*(?:PE-Bags|Paper Bags|Big Bag).*?)(?:\n(\d+)\s*Pallets?)?
-/gi,
-    text
-  );
-  const items = itemMatches.map(m => {
-    const product_name = clean(m[1]);
-    const net_kg   = parseFloat(m[2].replace(/\./g, "").replace(",", ".")) || null;
-    const pkgs     = parseInt(m[3], 10) || null;
-    const gross_kg = parseFloat(m[4].replace(/\./g, "").replace(",", ".")) || null;
-    const packaging = clean(m[5]);
-    const pallets   = m[6] ? parseInt(m[6], 10) : null;
-    return { product_name, net_kg, gross_kg, pkgs, packaging, pallets };
-  });
-
+ // Items (with packaging & pallets: accepts PE-Bags, Paper Bags, Big Bag; "Pallet" or "Pallets")
+const itemMatches = matchAll(
+  /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG[\s\S]*?(\d+\s*(?:PE-Bags|Paper Bags|Big Bag).*?)(?:\n(\d+)\s*Pallets?)?/gi,
+  text
+);
+const items = itemMatches.map(m => {
+  const product_name = clean(m[1]);
+  const net_kg   = parseFloat(m[2].replace(/\./g, "").replace(",", ".")) || null;
+  const pkgs     = parseInt(m[3], 10) || null;
+  const gross_kg = parseFloat(m[4].replace(/\./g, "").replace(",", ".")) || null;
+  const packaging = clean(m[5]);
+  const pallets   = m[6] ? parseInt(m[6], 10) : null;
+  return { product_name, net_kg, gross_kg, pkgs, packaging, pallets };
+});
   // Prefer order label PO, then explicit, then customer PO
   const po_no_explicit = match(/PO\s*No[.:\-]?\s*([A-Za-z0-9/ -]+)/i, text);
   const po_no = (order_label || po_no_explicit || customer_po || "").trim();
