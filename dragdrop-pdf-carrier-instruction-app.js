@@ -199,89 +199,86 @@ function parseShippingPoint(block) {
 
 // ------------------ PARSER (more tolerant to label variants) ------------------
 function parseFieldsFromText(textRaw) {
-// IDs (accept "No", "No.", "No:", etc.) and allow line breaks after the label
-const RE_NO    = String.raw`No\.?`;
-const RE_DATE  = String.raw`([0-9]{2}[.\-\/][0-9]{2}[.\-\/][0-9]{2,4})`;
-const takeLine = String.raw`([^\n]+)`;
+  // Normalize once; use `full` everywhere so we never rely on a free `text` var
+  const full = clean(textRaw).replace(/\r/g, "");
+  const norm = full.replace(/[\t\f]+/g, " ");
 
-const shipment_no = match(new RegExp(`Shipment\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), text) ||
-                    match(/Shipping\s*Note\s*[:\-]\s*([0-9A-Za-z\-]+)/i, text) || "";
+  // Helpers for common label variants
+  const RE_NO    = String.raw`No\.?`;
+  const RE_DATE  = String.raw`([0-9]{2}[.\-\/][0-9]{2}[.\-\/][0-9]{2,4})`;
+  const takeLine = String.raw`([^\n]+)`;
 
-const order_no    = match(new RegExp(`Order\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), text) || "";
+  // IDs & dates (tolerant)
+  const shipment_no = match(new RegExp(`Shipment\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), full) ||
+                      match(/Shipping\s*Note\s*[:\-]\s*([0-9A-Za-z\-]+)/i, full) || "";
+  const order_no    = match(new RegExp(`Order\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), full) || "";
+  const delivery_no = match(new RegExp(`Delivery\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), full) || "";
 
-const delivery_no = match(new RegExp(`Delivery\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), text) || "";
+  const loading_date =
+    match(new RegExp(`Loading\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), full) ||
+    match(/Loading\s*Date[.:\-]?\s*([0-9.\/-]+)/i, full) || "";
 
-const loading_date = match(new RegExp(`Loading\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), text) ||
-                     match(/Loading\s*Date[.:\-]?\s*([0-9.\/-]+)/i, text) || "";
+  const scheduled_delivery_date =
+    match(new RegExp(`Sched(?:uled)?\\s*Delivery\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), full) ||
+    match(/Scheduled\s*Delivery\s*Date[.:\-]?\s*([0-9.\/-]+)/i, full) || "";
 
-const scheduled_delivery_date =
-  match(new RegExp(`Sched(?:uled)?\\s*Delivery\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), text) ||
-  match(/Scheduled\s*Delivery\s*Date[.:\-]?\s*([0-9.\/-]+)/i, text) || "";
+  // Header contacts
+  const your_partner = match(/Your\s*Partner[.:\-]?\s*([^\n]+)/i, norm);
+  let   shipper_phone = match(/(?:Telephone|Phone)[.:\-]?\s*([^\n]+)/i, full);
+  shipper_phone = shipper_phone ? shipper_phone.replace(/^[^\d+]+/, "").trim() : "";
+  let   shipper_email = findEmail(match(/Email[.:\-]?\s*([^\n]+)/i, full) || "") ||
+                        findEmail(full.slice(Math.max(0, (full.indexOf("Email")||0) - 30), (full.indexOf("Email")||0) + 120));
 
-// NEW: always define these two, tolerate label variants
-const way_of_forwarding =
-  match(/Way\s*of\s*Forwarding[.:\-]?\s*([^\n]+?)(?=\s+(?:Delivery\s*Terms|PRODUCT|\n)|$)/i, text) || "";
+  // Way of forwarding / Incoterms
+  const way_of_forwarding =
+    match(/Way\s*of\s*Forwarding[.:\-]?\s*([^\n]+?)(?=\s+(?:Delivery\s*Terms|PRODUCT|\n)|$)/i, full) || "";
+  const delivery_terms =
+    match(/(?:Delivery\s*Terms|Incoterms)[.:\-]?\s*([A-Z0-9 .\-]+)/i, norm) || "";
 
-const delivery_terms =
-  match(/(?:Delivery\s*Terms|Incoterms)[.:\-]?\s*([A-Z0-9 .\-]+)/i, norm) || "";
-  const your_partner  = match(/Your\s*Partner[.:\-]?\s*([^\n]+)/i, norm);
-let shipper_phone = match(/(?:Telephone|Phone)[.:\-]?\s*([^\n]+)/i, text);
-shipper_phone = shipper_phone ? shipper_phone.replace(/^[^\d+]+/, "").trim() : "";
-
-let shipper_email = findEmail(match(/Email[.:\-]?\s*([^\n]+)/i, text) || "") ||
-                    findEmail(text.slice(Math.max(0, (text.indexOf("Email")||0) - 30), (text.indexOf("Email")||0) + 120));
-  // Carrier TO (generic catch for forwarder blocks; keep Expeditors example)
+  // Carrier “TO” block (common pattern)
   let carrier_to = "";
-  const carrierBlock = /(Expeditors International GmbH[\s\S]{0,200}?(?:GERMANY|USA|GREECE|NORWAY|[A-Z]{3,}))/i.exec(text);
+  const carrierBlock = /(Expeditors International GmbH[\s\S]{0,200}?(?:GERMANY|USA|GREECE|NORWAY|[A-Z]{3,}))/i.exec(full);
   if (carrierBlock) carrier_to = clean(carrierBlock[1]);
 
-  // Shipping Point block (several label variants)
-  const spBlock = match(/Shipping\s*Point(?:\s*address)?[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:Way of Forwarding|Delivery Terms|PRODUCT|Delivery Address|Consignee|Customer))/i, text);
+  // Shipping Point → split
+  const spBlock = match(/Shipping\s*Point(?:\s*address)?[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:Way of Forwarding|Delivery Terms|PRODUCT|Delivery Address|Consignee|Customer))/i, full);
   const sp = parseShippingPoint(spBlock);
 
-  // Consignee / Delivery Address (support both labels)
-// Try the canonical pattern first: from "Delivery Address" to "Customer No."
-let consignee_address = "";
-let consignee_block = match(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]*?)\n\s*Customer\s*No/i, text);
-
-// Fallback: take up to ~8 non-empty lines after "Delivery Address"
-if (!consignee_block) {
-  const m = /(?:Delivery\s*Address|Consignee)[.:\-]?\s*\n([\s\S]{0,400})/i.exec(text);
-  if (m) consignee_block = m[1];
-}
-
-if (consignee_block) {
-  const lines = consignee_block.split("\n").map(l => clean(l)).filter(Boolean);
-
-  // If the first line looks like a PLANT/COMPANY header, drop it.
-  const COMPANY_HINT = /(GMBH|LTD|LLC|INC|AG|G\.?M\.?B\.?H\.?|KRONOS|SCHMIDT|KATOEN|COVESTRO)/i;
-  const addrLines = (lines.length > 1 && COMPANY_HINT.test(lines[0])) ? lines.slice(1) : lines;
-
-  // Heuristic: if what we got still looks like the Shipping Point (contains 'NORDENHAM' or 'LEVERKUSEN'),
-  // try another occurrence of "Delivery Address".
-  let addr = addrLines.join("\n");
-  if (/NORDENHAM|LEVERKUSEN|NIEHL|MOLENKOPF/i.test(addr)) {
-    const all = matchAll(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]{0,300})/gi, text);
-    for (const mm of all) {
-      const candidate = clean(mm[1]).split("\n").map(l=>clean(l)).filter(Boolean).join("\n");
-      if (!/NORDENHAM|LEVERKUSEN|NIEHL|MOLENKOPF/i.test(candidate) && candidate.length > 10) { addr = candidate; break; }
-    }
+  // Consignee (avoid picking up Shipping Point)
+  let consignee_address = "";
+  let consignee_block = match(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]*?)\n\s*Customer\s*No/i, full);
+  if (!consignee_block) {
+    const m = /(?:Delivery\s*Address|Consignee)[.:\-]?\s*\n([\s\S]{0,400})/i.exec(full);
+    if (m) consignee_block = m[1];
   }
-  consignee_address = clean(addr);
-}
+  if (consignee_block) {
+    const lines = consignee_block.split("\n").map(l => clean(l)).filter(Boolean);
+    const COMPANY_HINT = /(GMBH|LTD|LLC|INC|AG|G\.?M\.?B\.?H\.?|KRONOS|SCHMIDT|KATOEN|COVESTRO)/i;
+    const addrLines = (lines.length > 1 && COMPANY_HINT.test(lines[0])) ? lines.slice(1) : lines;
 
-  const customer_no = match(new RegExp(`Customer\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), norm);
-  const customer_po = match(/Customer\s*PO\s*No[.:\-]?\s*([^\n]+)/i, norm);
+    let addr = addrLines.join("\n");
+    if (/NORDENHAM|LEVERKUSEN|NIEHL|MOLENKOPF/i.test(addr)) {
+      const all = matchAll(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]{0,300})/gi, full);
+      for (const mm of all) {
+        const candidate = clean(mm[1]).split("\n").map(l=>clean(l)).filter(Boolean).join("\n");
+        if (!/NORDENHAM|LEVERKUSEN|NIEHL|MOLENKOPF/i.test(candidate) && candidate.length > 10) { addr = candidate; break; }
+      }
+    }
+    consignee_address = clean(addr);
+  }
 
-  // Notify 1 (address + email + phone)
+  const customer_no = match(new RegExp(`Customer\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), full);
+  const customer_po = match(/Customer\s*PO\s*No[.:\-]?\s*([^\n]+)/i, full);
+
+  // Notify 1
   let notify1_address = "", notify1_email = "", notify1_phone = "";
-  const notify1_block = match(/Notify[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:MARKS\s*TEXT|NOTIFY\s*2|ORDER\s*No|B\/L|HS\s*CODE|KRONOS|$))/i, text);
+  const notify1_block = match(/Notify[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:MARKS\s*TEXT|NOTIFY\s*2|ORDER\s*No|B\/L|HS\s*CODE|KRONOS|$))/i, full);
   if (notify1_block) {
     const lines = notify1_block.split("\n").map(l => clean(l)).filter(Boolean);
     const addr = [];
     for (const line of lines) {
-      const email = findEmail(line); if (email) { notify1_email = email; continue; }
-      if (/Tel\.|Phone/i.test(line)) { notify1_phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i, ""); continue; }
+      const mail = findEmail(line); if (mail) { notify1_email = mail; continue; }
+      if (/Tel\.|Phone/i.test(line)) { notify1_phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i,""); continue; }
       if (/Vat No\./i.test(line)) continue;
       addr.push(line);
     }
@@ -290,79 +287,115 @@ if (consignee_block) {
 
   // Notify 2 (optional)
   let notify2_address = "", notify2_email = "", notify2_phone = "";
-  const notify2_block = match(/NOTIFY\s*2[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:PLEASE\s+ISSUE|B\/L|HS\s*CODE|MARKS|KRONOS|$))/i, text);
+  const notify2_block = match(/NOTIFY\s*2[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:PLEASE\s+ISSUE|B\/L|HS\s*CODE|MARKS|KRONOS|$))/i, full);
   if (notify2_block) {
     const lines = notify2_block.split("\n").map(l => clean(l)).filter(Boolean);
     const addr = [];
     for (const line of lines) {
-      const email = findEmail(line); if (email) { notify2_email = email; continue; }
+      const mail = findEmail(line); if (mail) { notify2_email = mail; continue; }
       if (/Tel\.|Phone|^\+?\d/i.test(line)) { notify2_phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i,""); continue; }
       addr.push(line);
     }
     notify2_address = addr.join("\n");
   }
 
-  // Marks / B/L / HS
-  const bl_remarks1 = clean(match(/B\/L\s*REMARKS[.:\-]?\s*([\s\S]*?)(?:\n\s*HS\s*CODE|(?:\n\s*MARKS)|\n\s*KRONOS|$)/i, text));
-  const bl_express  = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, text);
+  // B/L remarks & HS code
+  const bl_remarks1 = clean(match(/B\/L\s*REMARKS[.:\-]?\s*([\s\S]*?)(?:\n\s*HS\s*CODE|(?:\n\s*MARKS)|\n\s*KRONOS|$)/i, full));
+  const bl_express  = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, full);
   const bl_remarks  = bl_remarks1 || bl_express || "";
 
-const hs_code_raw = match(/HS\s*CODE[.:\-]?\s*([0-9 ]{4,})/i, text);
-const hs_code     = (hs_code_raw || "").replace(/\s+/g, "");
+  const hs_code_raw = match(/HS\s*CODE[.:\-]?\s*([0-9 ]{4,})/i, full);
+  const hs_code     = (hs_code_raw || "").replace(/\s+/g, "");
 
-  const order_label = match(/ORDER\s*No[.:\-]?\s*([A-Za-z0-9\/-]+)/i, text);
+  const order_label = match(/ORDER\s*No[.:\-]?\s*([A-Za-z0-9\/-]+)/i, full);
 
   // Totals
-  const t = /TOTAL\s*([0-9\.,]+)\s*KG\s*([0-9]+)\s*([0-9\.,]+)\s*KG/i.exec(text);
+  const t = /TOTAL\s*([0-9\.,]+)\s*KG\s*([0-9]+)\s*([0-9\.,]+)\s*KG/i.exec(full);
   const total_net_kg   = t ? parseFloat(t[1].replace(/\./g, "").replace(",", ".")) : null;
   const total_pkgs     = t ? parseInt(t[2], 10) : null;
   const total_gross_kg = t ? parseFloat(t[3].replace(/\./g, "").replace(",", ".")) : null;
 
- // Items (with packaging & pallets: accepts PE-Bags, Paper Bags, Big Bag; "Pallet" or "Pallets")
-const itemMatches = matchAll(
-  /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG[\s\S]*?(\d+\s*(?:PE-Bags|Paper Bags|Big Bag).*?)(?:\n(\d+)\s*Pallets?)?/gi,
-  text
-);
-const items = itemMatches.map(m => {
-  const product_name = clean(m[1]);
-  const net_kg   = parseFloat(m[2].replace(/\./g, "").replace(",", ".")) || null;
-  const pkgs     = parseInt(m[3], 10) || null;
-  const gross_kg = parseFloat(m[4].replace(/\./g, "").replace(",", ".")) || null;
-  const packaging = clean(m[5]);
-  const pallets   = m[6] ? parseInt(m[6], 10) : null;
-  return { product_name, net_kg, gross_kg, pkgs, packaging, pallets };
-});
-  // Prefer order label PO, then explicit, then customer PO
-  const po_no_explicit = match(/PO\s*No[.:\-]?\s*([A-Za-z0-9/ -]+)/i, text);
+  // Items (packaging & pallets; Pallet or Pallets)
+  const itemMatches = matchAll(
+    /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG[\s\S]*?(\d+\s*(?:PE-Bags|Paper Bags|Big Bag).*?)(?:\n(\d+)\s*Pallets?)?/gi,
+    full
+  );
+  const items = itemMatches.map(m => {
+    const product_name = clean(m[1]);
+    const net_kg   = parseFloat(m[2].replace(/\./g, "").replace(",", ".")) || null;
+    const pkgs     = parseInt(m[3], 10) || null;
+    const gross_kg = parseFloat(m[4].replace(/\./g, "").replace(",", ".")) || null;
+    const packaging = clean(m[5]);
+    const pallets   = m[6] ? parseInt(m[6], 10) : null;
+    return { product_name, net_kg, gross_kg, pkgs, packaging, pallets };
+  });
+
+  // PO preference: order label > explicit > customer PO
+  const po_no_explicit = match(/PO\s*No[.:\-]?\s*([A-Za-z0-9/ -]+)/i, full);
   const po_no = (order_label || po_no_explicit || customer_po || "").trim();
 
   // Optional customer contact block (e.g., Covestro)
-  let customer_contact = match(/\n([A-Z][A-Z ]{2,})\nPHONE:\s*[^\n]+\nEMAIL:\s*[^\n]+/i, text);
+  let customer_contact = match(/\n([A-Z][A-Z ]{2,})\nPHONE:\s*[^\n]+\nEMAIL:\s*[^\n]+/i, full);
   customer_contact = clean(customer_contact);
-  let customer_phone = match(/PHONE:\s*([^\n]+)/i, text);
-  let customer_email = findEmail(match(/EMAIL:\s*([^\n]+)/i, text));
+  let contact_phone = match(/PHONE:\s*([^\n]+)/i, full);
+  let contact_email = findEmail(match(/EMAIL:\s*([^\n]+)/i, full));
+
+  // Final tidy for a few fields that sometimes carry a leading ":" or "-"
+  function trimColon(s){ return (s||"").replace(/^\s*[:\-]+/, "").trim(); }
+  const _your_partner = trimColon(your_partner);
+  const _customer_po  = trimColon(customer_po);
+  const _order_label  = trimColon(order_label);
 
   return {
-    // Header
-    your_partner, shipper_phone, shipper_email,
-    shipment_no, order_no, delivery_no, loading_date, scheduled_delivery_date,
-    po_no, order_label,
-    // Shipping split
-    shipping_street: sp.street, shipping_postal: sp.postal, shipping_city: sp.city, shipping_country: sp.country,
-    // Logistics
-    way_of_forwarding: clean(way_of_forwarding), delivery_terms: clean(delivery_terms), carrier_to: clean(carrier_to),
-    // Consignee & customer
-    consignee_address: clean(consignee_address), customer_no, customer_po,
-    customer_contact, customer_phone, customer_email,
-    // Notify parties
-    notify1_address: clean(notify1_address), notify1_email: clean(notify1_email), notify1_phone: clean(notify1_phone),
-    notify2_address: clean(notify2_address), notify2_email: clean(notify2_email), notify2_phone: clean(notify2_phone),
-    // Goods & extras
-    total_net_kg, total_gross_kg, total_pkgs, bl_remarks, hs_code,
-    signature_name: "", signature_date: dayjs().format("YYYY-MM-DD"),
+    your_partner: _your_partner,
+    shipper_phone,
+    shipper_email,
+    shipment_no,
+    order_no,
+    delivery_no,
+    loading_date,
+    scheduled_delivery_date,
+    po_no,
+    order_label: _order_label,
+
+    shipping_street: sp.street,
+    shipping_postal: sp.postal,
+    shipping_city: sp.city,
+    shipping_country: sp.country,
+
+    way_of_forwarding: clean(way_of_forwarding),
+    delivery_terms:    clean(delivery_terms),
+    carrier_to:        clean(carrier_to),
+
+    consignee_address: clean(consignee_address),
+    customer_no,
+    customer_po: _customer_po,
+
+    customer_contact,
+    customer_phone: contact_phone || "",
+    customer_email: contact_email || "",
+
+    notify1_address: clean(notify1_address),
+    notify1_email:   clean(notify1_email),
+    notify1_phone:   clean(notify1_phone),
+
+    notify2_address: clean(notify2_address),
+    notify2_email:   clean(notify2_email),
+    notify2_phone:   clean(notify2_phone),
+
+    total_net_kg,
+    total_gross_kg,
+    total_pkgs,
+    bl_remarks,
+    hs_code,
+
+    signature_name: "",
+    signature_date: dayjs().format("YYYY-MM-DD"),
+
     items
   };
 }
+
 
 // ---------- UI ----------
 app.get("/", (_req, res) => {
