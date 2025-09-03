@@ -138,7 +138,7 @@ function clean(s) {
     .replace(/[ \t]+\n/g, "\n")
     .trim();
 }
-const stripPrefix = s => (s || "").replace(/^\s*[:\-•]+/, "").trim();
+const stripPrefix = s => (s || "").replace(/^[\s:!•._-]+/, "").trim();
 const onlyDigits  = s => (s || "").replace(/\D+/g, "");
 
 function validateAndScore(f) {
@@ -163,9 +163,10 @@ function match(re, text, i = 1) { const m = re.exec(text); return m ? clean(m[i]
 function matchAll(re, text) { const out = []; let m; while ((m = re.exec(text)) !== null) out.push(m); return out; }
 function normalizeEmailSpaces(s) { return (s || "").replace(/@([^\s]+)/g, (_, rest) => '@' + rest.replace(/\s+/g, '')); }
 function findEmail(line) {
-  const cleaned = normalizeEmailSpaces(line);
-  const m = cleaned.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-  return m ? m[0] : "";
+  const cleaned = normalizeEmailSpaces(line || "");
+  // require the address to start with a letter/number (so "-marina..." is rejected)
+  const m = cleaned.match(/\b[A-Z0-9][A-Z0-9._%+-]*@[A-Z0-9.-]+\.[A-Z]{2,}\b/i);
+  return m ? m[0].replace(/^[.\-_:;]+/, "") : "";
 }
 
 // Grab a value that appears AFTER a label (even if it's on the next line)
@@ -214,6 +215,49 @@ function parseShippingPoint(block) {
   return res;
 }
 
+// Remove unrelated labels/lines from the carrier block
+function sanitizeCarrierToBlock(s) {
+  if (!s) return "";
+  const DROP = /(Your\s*Partner|Telephone|Phone|Email|Shipment\s*No|Order\s*No|Delivery\s*No|Loading\s*Date|Shipping\s*Point|Street|Postal|City|Country|Way\s*of\s*Forwarding|Delivery\s*Terms|Incoterms)/i;
+  const out = [];
+  for (const raw of s.split("\n")) {
+    const line = clean(raw);
+    if (!line) {
+      if (out.length) break;
+      continue;
+    }
+    if (DROP.test(line)) break;
+    out.push(line);
+    if (out.length > 8) break;
+  }
+  return out.join("\n");
+}
+
+// Parse values that follow explicit labels inside a section block
+function parseLabeledFields(block, labels) {
+  const res = {};
+  if (!block) return res;
+  const lines = block.split("\n").map(l => clean(l));
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    for (const [key, rex] of Object.entries(labels)) {
+      if (rex.test(line)) {
+        let val = line.replace(rex, "").replace(/^[\s:.-]+/, "");
+        if (!val) {
+          let j = i + 1;
+          while (j < lines.length && !lines[j]) j++;
+          if (j < lines.length) val = lines[j];
+        }
+        for (const other of Object.values(labels)) {
+          val = val.replace(other, "").trim();
+        }
+        res[key] = clean(val);
+      }
+    }
+  }
+  return res;
+}
+
 // ---------- Extraction (parallel; OCR with pre-processing) ----------
 async function extractTextFromBuffer(pdfBuffer) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
@@ -235,12 +279,13 @@ async function extractTextFromBuffer(pdfBuffer) {
   // OCR (deskew/denoise)
   const pOCR = (async () => {
     try {
-      await run("pdftoppm", ["-r", "300", pdfPath, path.join(tmp, "pg"), "-png"]);
-      const pngs = fs.readdirSync(tmp).filter(f => f.startsWith("pg-") && f.endsWith(".png")).sort();
+      await run("pdftoppm", ["-r", "300", pdfPath, path.join(os.tmpdir(), "pg"), "-png"]);
+      const tmpDir = fs.readdirSync(os.tmpdir());
+      const pngs = tmpDir.filter(f => /^pg-\d+\.png$/i.test(f)).sort();
       if (!pngs.length) return "";
       let ocrText = "";
       for (const f of pngs) {
-        const inP = path.join(tmp, f), outP = path.join(tmp, "prep-" + f);
+        const inP = path.join(os.tmpdir(), f), outP = path.join(os.tmpdir(), "prep-" + f);
         await run("convert", [inP, "-deskew", "40%", "-strip", "-colorspace", "Gray",
                               "-contrast-stretch", "1%x1%", "-brightness-contrast", "10x15",
                               "-sharpen", "0x1", outP]);
@@ -302,45 +347,49 @@ function parseFieldsFromText(textRaw) {
       return m ? m[2] : "";
     })();
 
-  // Way of forwarding / Delivery terms
+  // ---------------- Shipping Point & Way/Terms (labeled section preferred) -----------
+  const spOuter = match(/Shipping\s*Point[\s\S]*?(?=\n\s*(?:Consignee|Delivery\s*Address|Notify|Goods\s*Information|B\/L|HS\s*Code|$))/i, full);
+  const lp = parseLabeledFields(spOuter, {
+    street:  /^\s*Street\b/i,
+    postal:  /^\s*Postal\b/i,
+    city:    /^\s*City\b/i,
+    country: /^\s*Country\b/i,
+    wof:     /^\s*Way\s*of\s*Forwarding\b/i,
+    terms:   /^\s*(?:Delivery\s*Terms|Incoterms)\b/i
+  });
+
+  let shipping_street  = stripPrefix(lp.street  || "");
+  let shipping_postal  = stripPrefix(lp.postal  || "");
+  let shipping_city    = stripPrefix(lp.city    || "");
+  let shipping_country = stripPrefix(lp.country || "");
+
+  if (!shipping_street && !shipping_city) {
+    const spBlock = match(/Shipping\s*Point(?:\s*address)?[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:Way of Forwarding|Delivery Terms|PRODUCT|Delivery Address|Consignee|Customer))/i, full);
+    const sp = parseShippingPoint(spBlock);
+    shipping_street  = shipping_street  || sp.street;
+    shipping_postal  = shipping_postal  || sp.postal;
+    shipping_city    = shipping_city    || sp.city;
+    shipping_country = shipping_country || sp.country;
+  }
+  // Clean up “Street” that accidentally swallowed "Way of Forwarding"
+  shipping_street = (shipping_street || "").replace(/\bWay\s*of\s*Forwarding.*$/i, "").replace(/^[\s:!•\-]+/, "");
+
   let way_of_forwarding =
-    grabNear(/Way\s*of\s*Forwarding/i, /([^\n]+)/i, full, 140) ||
-    match(/Way\s*of\s*Forwarding[.:\-]?\s*([^\n]+)/i, norm) || "";
-  way_of_forwarding = stripPrefix(way_of_forwarding);
-
+    stripPrefix(lp.wof || grabNear(/Way\s*of\s*Forwarding/i, /([^\n]+)/i, full, 140) || match(/Way\s*of\s*Forwarding[.:\-]?\s*([^\n]+)/i, full) || "");
   let delivery_terms =
-    grabNear(/(?:Delivery\s*Terms|Incoterms)/i, /([^\n]+)/i, full, 100) || "";
-  delivery_terms = stripPrefix(delivery_terms);
+    stripPrefix(lp.terms || grabNear(/(?:Delivery\s*Terms|Incoterms)/i, /([^\n]+)/i, full, 100) || "");
 
-  // Carrier TO (stop before header labels)
+  // ---------------- Carrier TO (prefer explicit section, then fallback) --------------
   let carrier_to = "";
-  {
-    const start = /Expeditors International GmbH/i.exec(full);
-    if (start) {
-      const tail = full.slice(start.index);
-      const stopAt = tail.search(/\n(?:Your\s*Partner|Telephone|Email|Shipment|Order|Loading|Delivery|Shipping\s*Point)/i);
-      const segment = stopAt > 0 ? tail.slice(0, stopAt) : tail.slice(0, 300);
-      const cm = segment.match(/\b(GERMANY|USA|GREECE|NORWAY|NETHERLANDS|TURKEY)\b/i);
-      carrier_to = clean(cm ? segment.slice(0, cm.index + cm[0].length) : segment);
-    }
+  const labelCT = /CARRIER\s+NOTIFICATION\s+TO[:\s]*/i.exec(full);
+  if (labelCT) {
+    carrier_to = sanitizeCarrierToBlock(full.slice(labelCT.index + labelCT[0].length, labelCT.index + 600));
+  } else {
+    const m = /(Expeditors International GmbH[\s\S]{0,260})/i.exec(full);
+    carrier_to = sanitizeCarrierToBlock(m ? m[1] : "");
   }
 
-  // Shipping Point block + label-based fields
-  const spBlock = match(/Shipping\s*Point(?:\s*address)?[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:Way of Forwarding|Delivery Terms|PRODUCT|Delivery Address|Consignee|Customer))/i, full);
-  const sp = parseShippingPoint(spBlock);
-
-  let shipping_street  = stripPrefix(match(/^\s*Street[.:\-]?\s*([^\n]+)/im, full));
-  let shipping_postal  = stripPrefix(match(/^\s*Postal[.:\-]?\s*([^\n]+)/im, full));
-  let shipping_city    = stripPrefix(match(/^\s*City[.:\-]?\s*([^\n]+)/im, full));
-  let shipping_country = stripPrefix(match(/^\s*Country[.:\-]?\s*([^\n]+)/im, full));
-  if ((!shipping_street && !shipping_city) && (sp.street || sp.city)) {
-    shipping_street  = sp.street;
-    shipping_postal  = sp.postal;
-    shipping_city    = sp.city;
-    shipping_country = sp.country;
-  }
-
-  // Consignee / Delivery Address
+  // ---------------- Consignee / Delivery Address -------------------------------------
   let consignee_address = "";
   let consignee_block = match(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]*?)\n\s*Customer\s*No/i, full);
   if (!consignee_block) {
@@ -366,39 +415,21 @@ function parseFieldsFromText(textRaw) {
     consignee_address = clean(addr);
   }
 
-  // Customer numbers
+  // ---------------- Customer numbers & contact (explicit fields only) ----------------
   const customer_no = match(/Customer\s*No[.:\-]?\s*([^\n]+)/i, full);
   const customer_po = match(/Customer\s*PO\s*No[.:\-]?\s*([^\n]+)/i, full);
 
-  // Notify 1 & 2
-  let notify1_address = "", notify1_email = "", notify1_phone = "";
-  const notify1_block = match(/Notify[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:MARKS\s*TEXT|NOTIFY\s*2|ORDER\s*No|B\/L|HS\s*CODE|KRONOS|$))/i, full);
-  if (notify1_block) {
-    const lines = notify1_block.split("\n").map(l => clean(l)).filter(Boolean);
-    const addr = [];
-    for (const line of lines) {
-      const mail = findEmail(line); if (mail) { notify1_email = mail; continue; }
-      if (/Tel\.|Phone/i.test(line)) { notify1_phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i,""); continue; }
-      if (/Vat No\./i.test(line)) continue;
-      addr.push(line);
-    }
-    notify1_address = addr.join("\n");
+  let customer_contact = stripPrefix(grabNear(/Customer\s*Contact/i, /([^\n]+)/i, full, 120));
+  let customer_phone   = stripPrefix(grabNear(/Customer\s*Phone\s*Number/i, /([^\n]+)/i, full, 80));
+  let customer_email   = findEmail(grabNear(/Customer\s*Email/i, /([^\n]+)/i, full, 140)) || "";
+
+  // Business rule: never allow KRONOS email in customer email; never copy shipper phone
+  if (/@kronosww\.com$/i.test(customer_email)) customer_email = "";
+  if (customer_phone && shipper_phone && onlyDigits(customer_phone) === onlyDigits(shipper_phone)) {
+    customer_phone = "";
   }
 
-  let notify2_address = "", notify2_email = "", notify2_phone = "";
-  const notify2_block = match(/NOTIFY\s*2[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:PLEASE\s+ISSUE|B\/L|HS\s*CODE|MARKS|KRONOS|$))/i, full);
-  if (notify2_block) {
-    const lines = notify2_block.split("\n").map(l => clean(l)).filter(Boolean);
-    const addr = [];
-    for (const line of lines) {
-      const mail = findEmail(line); if (mail) { notify2_email = mail; continue; }
-      if (/Tel\.|Phone|^\+?\d/i.test(line)) { notify2_phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i,""); continue; }
-      addr.push(line);
-    }
-    notify2_address = addr.join("\n");
-  }
-
-  // Marks / B/L / HS Code
+  // ---------------- Marks / B/L / HS Code -------------------------------------------
   const bl_remarks1 = clean(match(/B\/L\s*REMARKS[.:\-]?\s*([\s\S]*?)(?:\n\s*HS\s*CODE|(?:\n\s*MARKS)|\n\s*KRONOS|$)/i, full));
   const bl_express  = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, full);
   const bl_remarks  = bl_remarks1 || bl_express || "";
@@ -406,7 +437,7 @@ function parseFieldsFromText(textRaw) {
 
   const order_label = match(/ORDER\s*No[.:\-]?\s*([A-Za-z0-9\/-]+)/i, full);
 
-  // Totals & items
+  // ---------------- Totals & items ---------------------------------------------------
   const t = /TOTAL\s*([0-9\.,]+)\s*KG\s*([0-9]+)\s*([0-9\.,]+)\s*KG/i.exec(full);
   const total_net_kg   = t ? parseFloat(t[1].replace(/\./g, "").replace(",", ".")) : null;
   const total_pkgs     = t ? parseInt(t[2], 10) : null;
@@ -426,26 +457,10 @@ function parseFieldsFromText(textRaw) {
     return { product_name, net_kg, gross_kg, pkgs, packaging, pallets };
   });
 
-  // PO preference
+  // ---------------- PO preference & tidy --------------------------------------------
   const po_no_explicit = match(/PO\s*No[.:\-]?\s*([A-Za-z0-9/ -]+)/i, full);
   const po_no = (order_label || po_no_explicit || customer_po || "").trim();
 
-  // Optional explicit customer-contact block (rare)
-  let customer_contact = match(/\n([A-Z][A-Z ]{2,})\nPHONE:\s*[^\n]+\nEMAIL:\s*[^\n]+/i, full);
-  customer_contact = clean(customer_contact);
-
-  // Explicit customer fields (avoid shipper bleed)
-  let customer_phone = stripPrefix(grabNear(/Customer\s*Phone\s*Number/i, /([^\n]+)/i, full, 80));
-  let customer_email = findEmail(grabNear(/Customer\s*Email/i, /([^\n]+)/i, full, 140)) || "";
-  customer_contact = stripPrefix(grabNear(/Customer\s*Contact/i, /([^\n]+)/i, full, 120)) || customer_contact;
-
-  // Business rule: never allow KRONOS email in customer email; never copy shipper phone
-  if (/@kronosww\.com$/i.test(customer_email)) customer_email = "";
-  if (customer_phone && shipper_phone && onlyDigits(customer_phone) === onlyDigits(shipper_phone)) {
-    customer_phone = "";
-  }
-
-  // Tidy some prefixed fields
   const _shipment_no = stripPrefix(shipment_no);
   const _order_no    = stripPrefix(order_no);
   const _delivery_no = stripPrefix(delivery_no);
