@@ -1,3 +1,9 @@
+/**
+ * Carrier Notification Letter
+ * PDF → Autofill form → Save to SQLite
+ * Extraction pipeline: pdf-parse + pdftotext -layout + Tesseract OCR
+ */
+
 // ====== REQUIRES ======
 const express = require("express");
 const multer = require("multer");
@@ -115,18 +121,26 @@ ensureColumns("shipments", {
 });
 ensureColumns("items", { packaging: "TEXT", pallets: "INTEGER" });
 
-// ====== APP SETUP CONTINUES BELOW (routes, parsers, etc.) ======
-
-
-// ====== APP SETUP CONTINUES BELOW (routes, parsers, etc.) ======
-
-
 // ---------- App ----------
 const app = express();
 app.use(express.json({ limit: "8mb" }));
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ---------- Extraction helpers (robust) ----------
+// ---------- Helpers ----------
+function clean(s) {
+  return (s || "")
+    .replace(/\u00A0/g, " ")              // NBSP -> space
+    .replace(/[‐–—−]/g, "-")              // dashes -> '-'
+    .replace(/[“”]/g, '"')
+    .replace(/[’‘]/g, "'")
+    .replace(/[：]/g, ":")                 // fullwidth colon
+    .replace(/\s+[ \t]/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+}
+const stripPrefix = s => (s || "").replace(/^\s*[:\-•]+/, "").trim();
+const onlyDigits  = s => (s || "").replace(/\D+/g, "");
+
 function validateAndScore(f) {
   let score = 0;
   const warn = [];
@@ -145,100 +159,39 @@ function validateAndScore(f) {
   return { score, warnings: warn };
 }
 
-function clean(s) {
-  return (s || "")
-    .replace(/\u00A0/g, " ")              // NBSP -> space
-    .replace(/[‐-–—−]/g, "-")             // dashes -> '-'
-    .replace(/[“”]/g, '"')
-    .replace(/[’‘]/g, "'")
-    .replace(/[：]/g, ":")                 // fullwidth colon
-    .replace(/\s+[ \t]/g, " ")
-    .replace(/[ \t]+\n/g, "\n")
-    .trim();
-}
-function looksGood(txt) {
-  const keys = ["shipment", "order", "delivery", "notify", "total"];
-  const low = (txt || "").toLowerCase();
-  return keys.filter(k => low.includes(k)).length >= 3 && txt.length > 300;
-}
-function execToString(cmd, args) {
-  return new Promise((resolve, reject) => {
-    require("child_process").execFile(cmd, args, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
-      if (err) return reject(err);
-      resolve(stdout.toString("utf8"));
-    });
-  });
-}
-async function extractTextFromBuffer(pdfBuffer) {
-  // write once to disk for CLI tools
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
-  const pdfPath = path.join(tmp, "input.pdf");
-  fs.writeFileSync(pdfPath, pdfBuffer);
-
-  // helper: run a command and return stdout
-  const run = (cmd, args) => new Promise((res) => {
-    execFile(cmd, args, { maxBuffer: 50 * 1024 * 1024 }, (err, out) => res(err ? "" : out.toString("utf8")));
-  });
-
-  // pdf-parse
-  const pPdfParse = (async () => {
-    try { const a = await pdfParse(pdfBuffer); return a?.text || ""; } catch { return ""; }
-  })();
-
-  // pdftotext -layout
-  const pPdftotext = run("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
-
-  // OCR path with pre-processing (deskew/denoise)
-  const pOCR = (async () => {
-    try {
-      // 1) pdf -> pngs
-      await run("pdftoppm", ["-r", "300", pdfPath, path.join(tmp, "pg"), "-png"]);
-      const pngs = fs.readdirSync(tmp).filter(f => f.startsWith("pg-") && f.endsWith(".png")).sort();
-      if (!pngs.length) return "";
-      let ocrText = "";
-      for (const f of pngs) {
-        const inP = path.join(tmp, f), outP = path.join(tmp, "prep-" + f);
-        // deskew + grayscale + light denoise/sharpen
-        await run("convert", [inP, "-deskew", "40%", "-strip", "-colorspace", "Gray",
-                              "-contrast-stretch", "1%x1%", "-brightness-contrast", "10x15",
-                              "-sharpen", "0x1", outP]);
-        ocrText += "\n" + await run("tesseract", [outP, "stdout", "--psm", "4"]);
-      }
-      return ocrText;
-    } catch { return ""; }
-  })();
-
-  // wait for all, then pick best by score
-  const [t1, t2, t3] = await Promise.all([pPdfParse, pPdftotext, pOCR]);
-  const candidates = [t1, t2, t3].filter(Boolean);
-  if (!candidates.length) return "";
-
-  const best = candidates
-    .map(t => ({ t, score: scoreText(t) }))
-    .sort((a, b) => b.score - a.score)[0].t;
-
-  return best;
-}
-
-// heuristic scoring: keywords + numbers + dates + size
-function scoreText(txt) {
-  if (!txt) return 0;
-  const keys = ["Shipment", "Order", "Delivery", "Delivery Address", "Notify", "TOTAL", "Way of Forwarding"];
-  const keyHits = keys.reduce((n, k) => n + (txt.includes(k) ? 1 : 0), 0);
-  const numbers = (txt.match(/\b\d{5,}\b/g) || []).length;
-  const dates = (txt.match(/\b\d{2}[./-]\d{2}[./-]\d{2,4}\b/g) || []).length;
-  const lenScore = Math.min(20, Math.floor(txt.length / 2000));
-  return keyHits * 10 + Math.min(20, numbers) + Math.min(10, dates) + lenScore;
-}
-
 function match(re, text, i = 1) { const m = re.exec(text); return m ? clean(m[i]) : ""; }
 function matchAll(re, text) { const out = []; let m; while ((m = re.exec(text)) !== null) out.push(m); return out; }
-
 function normalizeEmailSpaces(s) { return (s || "").replace(/@([^\s]+)/g, (_, rest) => '@' + rest.replace(/\s+/g, '')); }
 function findEmail(line) {
   const cleaned = normalizeEmailSpaces(line);
   const m = cleaned.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   return m ? m[0] : "";
+}
+
+// Grab a value that appears AFTER a label (even if it's on the next line)
+function grabNear(labelRe, valueRe, text, windowChars = 120) {
+  const m = labelRe.exec(text);
+  if (!m) return "";
+  const start = m.index + m[0].length;
+  const seg   = text.slice(start, Math.min(text.length, start + windowChars));
+  const mv    = valueRe.exec(seg);
+  return mv ? clean(mv[1] ?? mv[0]) : "";
+}
+
+// Grab 1–N lines after a label until a stop word appears
+function grabBlock(labelRe, stopRes, text, maxLines = 8) {
+  const m = labelRe.exec(text);
+  if (!m) return "";
+  const tail = text.slice(m.index + m[0].length);
+  const lines = tail.split("\n").map(l => clean(l));
+  const out = [];
+  for (const line of lines) {
+    if (!line) break; // stop on first blank line
+    if (stopRes.some(r => r.test(line))) break;
+    out.push(line);
+    if (out.length >= maxLines) break;
+  }
+  return out.join("\n");
 }
 
 function parseShippingPoint(block) {
@@ -261,50 +214,78 @@ function parseShippingPoint(block) {
   return res;
 }
 
-// ------------------ PARSER (more tolerant to label variants) ------------------
-// Grab a value that appears close to a label (even if it's on the next line)
-function grabNear(labelRe, valueRe, text, windowChars = 120) {
-  const m = labelRe.exec(text);
-  if (!m) return "";
-  const start = Math.max(0, m.index);
-  const end   = Math.min(text.length, m.index + m[0].length + windowChars);
-  const seg   = text.slice(start, end);
-  const mv    = valueRe.exec(seg);
-  if (!mv) return "";
-  // Prefer capture group 1 if provided, else whole match
-  return clean(mv[1] ?? mv[0]);
+// ---------- Extraction (parallel; OCR with pre-processing) ----------
+async function extractTextFromBuffer(pdfBuffer) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
+  const pdfPath = path.join(tmp, "input.pdf");
+  fs.writeFileSync(pdfPath, pdfBuffer);
+
+  const run = (cmd, args) => new Promise((res) => {
+    execFile(cmd, args, { maxBuffer: 50 * 1024 * 1024 }, (err, out) => res(err ? "" : out.toString("utf8")));
+  });
+
+  // pdf-parse
+  const pPdfParse = (async () => {
+    try { const a = await pdfParse(pdfBuffer); return a?.text || ""; } catch { return ""; }
+  })();
+
+  // pdftotext -layout
+  const pPdftotext = run("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
+
+  // OCR (deskew/denoise)
+  const pOCR = (async () => {
+    try {
+      await run("pdftoppm", ["-r", "300", pdfPath, path.join(tmp, "pg"), "-png"]);
+      const pngs = fs.readdirSync(tmp).filter(f => f.startsWith("pg-") && f.endsWith(".png")).sort();
+      if (!pngs.length) return "";
+      let ocrText = "";
+      for (const f of pngs) {
+        const inP = path.join(tmp, f), outP = path.join(tmp, "prep-" + f);
+        await run("convert", [inP, "-deskew", "40%", "-strip", "-colorspace", "Gray",
+                              "-contrast-stretch", "1%x1%", "-brightness-contrast", "10x15",
+                              "-sharpen", "0x1", outP]);
+        ocrText += "\n" + await run("tesseract", [outP, "stdout", "--psm", "4"]);
+      }
+      return ocrText;
+    } catch { return ""; }
+  })();
+
+  const [t1, t2, t3] = await Promise.all([pPdfParse, pPdftotext, pOCR]);
+  const candidates = [t1, t2, t3].filter(Boolean);
+  if (!candidates.length) return "";
+
+  const best = candidates
+    .map(t => ({ t, score: scoreText(t) }))
+    .sort((a, b) => b.score - a.score)[0].t;
+
+  return best;
 }
 
-// Grab 1–N lines after a label until a stop word appears
-function grabBlock(labelRe, stopRes, text, maxLines = 8) {
-  const m = labelRe.exec(text);
-  if (!m) return "";
-  const tail = text.slice(m.index + m[0].length);
-  const lines = tail.split("\n").map(l => clean(l));
-  const out = [];
-  for (const line of lines) {
-    if (!line) break; // stop on first blank line
-    if (stopRes.some(r => r.test(line))) break;
-    out.push(line);
-    if (out.length >= maxLines) break;
-  }
-  return out.join("\n");
+function scoreText(txt) {
+  if (!txt) return 0;
+  const keys = ["Shipment", "Order", "Delivery", "Delivery Address", "Notify", "TOTAL", "Way of Forwarding"];
+  const keyHits = keys.reduce((n, k) => n + (txt.includes(k) ? 1 : 0), 0);
+  const numbers = (txt.match(/\b\d{5,}\b/g) || []).length;
+  const dates = (txt.match(/\b\d{2}[./-]\d{2}[./-]\d{2,4}\b/g) || []).length;
+  const lenScore = Math.min(20, Math.floor(txt.length / 2000));
+  return keyHits * 10 + Math.min(20, numbers) + Math.min(10, dates) + lenScore;
 }
+
+// ---------- PARSER ----------
 function parseFieldsFromText(textRaw) {
   const full = clean(textRaw).replace(/\r/g, "");
   const norm = full.replace(/[\t\f]+/g, " ");
 
-  // ---------------- Header block (top of page only) ----------------
+  // Header block (top only)
   const top = full.slice(0, 2000);
   const anchor = top.search(/Your\s*Partner|Telephone|Email/i);
   const headerBlock = anchor >= 0 ? top.slice(Math.max(0, anchor - 80), anchor + 600) : top.slice(0, 600);
 
-  const your_partner = clean(grabNear(/Your\s*Partner[.:\-]?/i, /([^\n]+)/i, headerBlock, 100));
-  let shipper_phone  = grabNear(/(?:Telephone|Phone)[.:\-]?/i, /(\+?[0-9][0-9 ()\/\-]+)/i, headerBlock, 120);
-  shipper_phone = shipper_phone ? shipper_phone.replace(/^[^\d+]+/, "").trim() : "";
-  let shipper_email = findEmail(grabNear(/Email[.:\-]?/i, /([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/i, headerBlock, 140)) || "";
+  const your_partner = stripPrefix(grabNear(/Your\s*Partner[.:\-]?/i, /([^\n]+)/i, headerBlock, 100));
+  let shipper_phone  = stripPrefix(grabNear(/(?:Telephone|Phone)[.:\-]?/i, /(\+?[0-9][0-9 ()\/\-]+)/i, headerBlock, 120));
+  let shipper_email  = findEmail(grabNear(/Email[.:\-]?/i, /([^\n]+)/i, headerBlock, 140)) || "";
 
-  // ---------------- IDs & dates (require digits; allow next-line values) ----------------
+  // IDs & Dates
   const grabNum = (lab) => grabNear(lab, /([0-9]{4,}[0-9A-Za-z\-]*)/, full, 120) || "";
   const shipment_no = grabNum(/Shipment\s*No\b/i);
   const order_no    = grabNum(/Order\s*No\b/i);
@@ -312,26 +293,54 @@ function parseFieldsFromText(textRaw) {
 
   const grabDate = (lab) => grabNear(lab, /([0-9]{2}[.\-\/][0-9]{2}[.\-\/][0-9]{2,4})/, full, 90) || "";
   const loading_date = grabDate(/Loading\s*Date\b/i);
-  const scheduled_delivery_date = grabDate(/Sched(?:uled)?\s*Delivery\s*Date\b/i);
 
-  // ---------------- Way of forwarding / Delivery terms ----------------
-  const way_of_forwarding =
-    grabNear(/Way\s*of\s*Forwarding/i, /([A-Za-z0-9"() \-]{3,})/, full, 140) ||
+  // handle both "Sched. Delivery Date" and "Scheduled Delivery Date"
+  let scheduled_delivery_date =
+    grabDate(/Sched\.?(?:uled)?\s*Delivery\s*Date\b/i) ||
+    (function(){
+      const m = /(Sched\.?(?:uled)?\s*Delivery\s*Date[^\d]{0,30})(\d{2}[.\-\/]\d{2}[.\-\/]\d{2,4})/i.exec(full);
+      return m ? m[2] : "";
+    })();
+
+  // Way of forwarding / Delivery terms
+  let way_of_forwarding =
+    grabNear(/Way\s*of\s*Forwarding/i, /([^\n]+)/i, full, 140) ||
     match(/Way\s*of\s*Forwarding[.:\-]?\s*([^\n]+)/i, norm) || "";
+  way_of_forwarding = stripPrefix(way_of_forwarding);
 
-  const delivery_terms =
-    grabNear(/(?:Delivery\s*Terms|Incoterms)/i, /([A-Z]{3}\s+[A-Za-z0-9 \-]+|[A-Z]{3,})/, full, 100) || "";
+  let delivery_terms =
+    grabNear(/(?:Delivery\s*Terms|Incoterms)/i, /([^\n]+)/i, full, 100) || "";
+  delivery_terms = stripPrefix(delivery_terms);
 
-  // ---------------- Carrier TO (common case) ----------------
+  // Carrier TO (stop before header labels)
   let carrier_to = "";
-  const carrierBlock = /(Expeditors International GmbH[\s\S]{0,200}?(?:GERMANY|USA|GREECE|NORWAY|[A-Z]{3,}))/i.exec(full);
-  if (carrierBlock) carrier_to = clean(carrierBlock[1]);
+  {
+    const start = /Expeditors International GmbH/i.exec(full);
+    if (start) {
+      const tail = full.slice(start.index);
+      const stopAt = tail.search(/\n(?:Your\s*Partner|Telephone|Email|Shipment|Order|Loading|Delivery|Shipping\s*Point)/i);
+      const segment = stopAt > 0 ? tail.slice(0, stopAt) : tail.slice(0, 300);
+      const cm = segment.match(/\b(GERMANY|USA|GREECE|NORWAY|NETHERLANDS|TURKEY)\b/i);
+      carrier_to = clean(cm ? segment.slice(0, cm.index + cm[0].length) : segment);
+    }
+  }
 
-  // ---------------- Shipping Point → split ----------------
+  // Shipping Point block + label-based fields
   const spBlock = match(/Shipping\s*Point(?:\s*address)?[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:Way of Forwarding|Delivery Terms|PRODUCT|Delivery Address|Consignee|Customer))/i, full);
   const sp = parseShippingPoint(spBlock);
 
-  // ---------------- Consignee / Delivery Address (clean block) ----------------
+  let shipping_street  = stripPrefix(match(/^\s*Street[.:\-]?\s*([^\n]+)/im, full));
+  let shipping_postal  = stripPrefix(match(/^\s*Postal[.:\-]?\s*([^\n]+)/im, full));
+  let shipping_city    = stripPrefix(match(/^\s*City[.:\-]?\s*([^\n]+)/im, full));
+  let shipping_country = stripPrefix(match(/^\s*Country[.:\-]?\s*([^\n]+)/im, full));
+  if ((!shipping_street && !shipping_city) && (sp.street || sp.city)) {
+    shipping_street  = sp.street;
+    shipping_postal  = sp.postal;
+    shipping_city    = sp.city;
+    shipping_country = sp.country;
+  }
+
+  // Consignee / Delivery Address
   let consignee_address = "";
   let consignee_block = match(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]*?)\n\s*Customer\s*No/i, full);
   if (!consignee_block) {
@@ -344,11 +353,9 @@ function parseFieldsFromText(textRaw) {
   }
   if (consignee_block) {
     let lines = consignee_block.split("\n").map(l => clean(l)).filter(Boolean);
-    // Drop obvious non-consignee lines
     const BAN = /(^(Buyer|VAT\s*No\.?)$)|KRONOS|Peschstrasse|Leverkusen/i;
     lines = lines.filter(l => !BAN.test(l));
     let addr = lines.join("\n");
-    // If we accidentally grabbed a plant address, try another occurrence
     if (/NORDENHAM|LEVERKUSEN|NIEHL|MOLENKOPF/i.test(addr)) {
       const all = matchAll(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]{0,300})/gi, full);
       for (const mm of all) {
@@ -359,11 +366,11 @@ function parseFieldsFromText(textRaw) {
     consignee_address = clean(addr);
   }
 
-  // ---------------- Customer numbers ----------------
+  // Customer numbers
   const customer_no = match(/Customer\s*No[.:\-]?\s*([^\n]+)/i, full);
   const customer_po = match(/Customer\s*PO\s*No[.:\-]?\s*([^\n]+)/i, full);
 
-  // ---------------- Notify 1 & 2 ----------------
+  // Notify 1 & 2
   let notify1_address = "", notify1_email = "", notify1_phone = "";
   const notify1_block = match(/Notify[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:MARKS\s*TEXT|NOTIFY\s*2|ORDER\s*No|B\/L|HS\s*CODE|KRONOS|$))/i, full);
   if (notify1_block) {
@@ -391,7 +398,7 @@ function parseFieldsFromText(textRaw) {
     notify2_address = addr.join("\n");
   }
 
-  // ---------------- Marks / B/L / HS Code ----------------
+  // Marks / B/L / HS Code
   const bl_remarks1 = clean(match(/B\/L\s*REMARKS[.:\-]?\s*([\s\S]*?)(?:\n\s*HS\s*CODE|(?:\n\s*MARKS)|\n\s*KRONOS|$)/i, full));
   const bl_express  = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, full);
   const bl_remarks  = bl_remarks1 || bl_express || "";
@@ -399,7 +406,7 @@ function parseFieldsFromText(textRaw) {
 
   const order_label = match(/ORDER\s*No[.:\-]?\s*([A-Za-z0-9\/-]+)/i, full);
 
-  // ---------------- Totals & items ----------------
+  // Totals & items
   const t = /TOTAL\s*([0-9\.,]+)\s*KG\s*([0-9]+)\s*([0-9\.,]+)\s*KG/i.exec(full);
   const total_net_kg   = t ? parseFloat(t[1].replace(/\./g, "").replace(",", ".")) : null;
   const total_pkgs     = t ? parseInt(t[2], 10) : null;
@@ -419,59 +426,72 @@ function parseFieldsFromText(textRaw) {
     return { product_name, net_kg, gross_kg, pkgs, packaging, pallets };
   });
 
-  // ---------------- PO preference ----------------
+  // PO preference
   const po_no_explicit = match(/PO\s*No[.:\-]?\s*([A-Za-z0-9/ -]+)/i, full);
   const po_no = (order_label || po_no_explicit || customer_po || "").trim();
 
-  // ---------------- Optional explicit customer-contact block ----------------
+  // Optional explicit customer-contact block (rare)
   let customer_contact = match(/\n([A-Z][A-Z ]{2,})\nPHONE:\s*[^\n]+\nEMAIL:\s*[^\n]+/i, full);
   customer_contact = clean(customer_contact);
-  let contact_phone = match(/PHONE:\s*([^\n]+)/i, full);
-  let contact_email = findEmail(match(/EMAIL:\s*([^\n]+)/i, full));
 
-  // tidy some fields that sometimes include ":" at start
-  const trimColon = s => (s||"").replace(/^\s*[:\-]+/, "").trim();
-  const _customer_po  = trimColon(customer_po);
-  const _order_label  = trimColon(order_label);
+  // Explicit customer fields (avoid shipper bleed)
+  let customer_phone = stripPrefix(grabNear(/Customer\s*Phone\s*Number/i, /([^\n]+)/i, full, 80));
+  let customer_email = findEmail(grabNear(/Customer\s*Email/i, /([^\n]+)/i, full, 140)) || "";
+  customer_contact = stripPrefix(grabNear(/Customer\s*Contact/i, /([^\n]+)/i, full, 120)) || customer_contact;
+
+  // Business rule: never allow KRONOS email in customer email; never copy shipper phone
+  if (/@kronosww\.com$/i.test(customer_email)) customer_email = "";
+  if (customer_phone && shipper_phone && onlyDigits(customer_phone) === onlyDigits(shipper_phone)) {
+    customer_phone = "";
+  }
+
+  // Tidy some prefixed fields
+  const _shipment_no = stripPrefix(shipment_no);
+  const _order_no    = stripPrefix(order_no);
+  const _delivery_no = stripPrefix(delivery_no);
+  const _po_no       = stripPrefix(po_no);
+  const _customer_no = stripPrefix(customer_no);
+  const _customer_po = stripPrefix(customer_po);
+  const _order_label = stripPrefix(order_label);
 
   return {
-    your_partner: your_partner,
+    your_partner,
     shipper_phone,
     shipper_email,
 
-    shipment_no,
-    order_no,
-    delivery_no,
+    shipment_no: _shipment_no,
+    order_no: _order_no,
+    delivery_no: _delivery_no,
     loading_date,
     scheduled_delivery_date,
 
-    po_no,
+    po_no: _po_no,
     order_label: _order_label,
 
-    shipping_street: sp.street,
-    shipping_postal: sp.postal,
-    shipping_city:   sp.city,
-    shipping_country: sp.country,
+    shipping_street,
+    shipping_postal,
+    shipping_city,
+    shipping_country,
 
-    way_of_forwarding: clean(way_of_forwarding),
-    delivery_terms:    clean(delivery_terms),
-    carrier_to:        clean(carrier_to),
+    way_of_forwarding,
+    delivery_terms,
+    carrier_to,
 
-    consignee_address: clean(consignee_address),
-    customer_no,
+    consignee_address,
+    customer_no: _customer_no,
     customer_po: _customer_po,
 
     customer_contact,
-    customer_phone: contact_phone || "",
-    customer_email: contact_email || "",
+    customer_phone,
+    customer_email,
 
-    notify1_address: clean(notify1_address),
-    notify1_email:   clean(notify1_email),
-    notify1_phone:   clean(notify1_phone),
+    notify1_address,
+    notify1_email,
+    notify1_phone,
 
-    notify2_address: clean(notify2_address),
-    notify2_email:   clean(notify2_email),
-    notify2_phone:   clean(notify2_phone),
+    notify2_address,
+    notify2_email,
+    notify2_phone,
 
     total_net_kg,
     total_gross_kg,
@@ -655,12 +675,11 @@ app.get("/", (_req, res) => {
 </div>
 
 <script>
-// util
 var $ = function(sel){ return document.querySelector(sel); };
 var statusEl = $("#status");
 var prodWrap = $("#products");
 
-// product card component (uses ONLY single-quoted strings to avoid nested backticks)
+// product card
 function makeProductCard(idx, data){
   data = data || {};
   var div = document.createElement('div');
@@ -701,7 +720,7 @@ drop.addEventListener("dragover", function(e){ e.preventDefault(); });
 drop.addEventListener("drop", function(e){ e.preventDefault(); handleFiles(e.dataTransfer.files); });
 file.addEventListener("change", function(e){ handleFiles(e.target.files); });
 
-// hardened upload
+// upload (nocache=1 while iterating)
 async function handleFiles(files){
   var f = files[0]; if (!f) return;
   statusEl.textContent = "Uploading & extracting…";
@@ -712,7 +731,7 @@ async function handleFiles(files){
     var ctrl = new AbortController();
     var to = setTimeout(function(){ ctrl.abort(); }, 180000);
 
-    var r = await fetch("/api/upload", { method: "POST", body: fd, signal: ctrl.signal });
+    var r = await fetch("/api/upload?nocache=1", { method: "POST", body: fd, signal: ctrl.signal });
     clearTimeout(to);
 
     var raw = await r.text();
@@ -735,7 +754,6 @@ async function handleFiles(files){
     console.error(err);
   }
 }
-
 
 function setVal(id, val){ var el = document.getElementById(id); if(el) el.value = val || ""; }
 
@@ -862,36 +880,36 @@ document.getElementById("signature_date").value = new Date().toISOString().slice
 </body></html>`);
 });
 
-
 // ---------- API ----------
 app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
+    const noCache = String(req.query.nocache || "") === "1";
     const hash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
 
-    // Cache hit?
-    const cached = db.prepare("SELECT parsed FROM cache WHERE hash = ?").get(hash);
-    if (cached?.parsed) {
-      const parsed = JSON.parse(cached.parsed);
-      return res.json(parsed);
+    if (!noCache) {
+      const cached = db.prepare("SELECT parsed FROM cache WHERE hash = ?").get(hash);
+      if (cached?.parsed) {
+        const parsed = JSON.parse(cached.parsed);
+        return res.json(parsed);
+      }
     }
 
-    // Extract best text in parallel
     const text = await extractTextFromBuffer(req.file.buffer);
     if (!text || !text.trim()) {
       return res.status(422).json({ error: "Unable to extract text (try /api/debug-text to inspect raw text)" });
     }
 
-    // Parse + score
     const fields = parseFieldsFromText(text);
     const { score, warnings } = validateAndScore(fields);
     fields.confidence = score;
     fields.warnings = warnings;
 
-    // Cache store
-    db.prepare("INSERT OR REPLACE INTO cache (hash, text, parsed, created_at) VALUES (?, ?, ?, ?)")
-      .run(hash, text, JSON.stringify(fields), new Date().toISOString());
+    if (!noCache) {
+      db.prepare("INSERT OR REPLACE INTO cache (hash, text, parsed, created_at) VALUES (?, ?, ?, ?)")
+        .run(hash, text, JSON.stringify(fields), new Date().toISOString());
+    }
 
     res.json(fields);
   } catch (err) {
@@ -900,9 +918,7 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-
-
-// PATCH B — DEBUG ENDPOINT (paste here ↓)
+// Debug endpoint
 app.post("/api/debug-text", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file" });
