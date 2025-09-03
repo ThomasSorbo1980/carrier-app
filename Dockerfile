@@ -1,19 +1,22 @@
 FROM node:20-bullseye
 
-# Build tools needed for better-sqlite3
+# build tools for better-sqlite3
 RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install dependencies
+# install deps
 COPY package*.json ./
 RUN npm install --omit=dev
 
-# Copy all repo files into the image
+# copy app
 COPY . .
 
-ENV PORT=3000
-ENV SQLITE_DB_PATH=/data/shipments.db
+# don't set PORT here; Render sets it
+# ENV PORT=3000   <-- REMOVE this line
 
+# optional; harmless
 EXPOSE 3000
+
+# app will read process.env.PORT from Render
 CMD ["node","dragdrop-pdf-carrier-instruction-app.js"]
