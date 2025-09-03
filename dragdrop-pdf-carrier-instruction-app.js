@@ -1,6 +1,9 @@
 /**
- * Carrier Notification PDF → Autofill Form → Save to SQLite (Render with disk)
+ * Carrier Notification Letter
+ * Drag & drop PDF → Autofill the form (screenshot layout) → Save to SQLite (Render disk)
+ * Text extraction pipeline: pdf-parse → pdftotext -layout → Tesseract OCR (fallback)
  */
+
 const express = require("express");
 const multer = require("multer");
 const pdfParse = require("pdf-parse");
@@ -9,40 +12,54 @@ const Database = require("better-sqlite3");
 const { nanoid } = require("nanoid");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
+const { execFile } = require("child_process");
 
-// Use disk path if provided (Render), fallback to local file
+// ---------- DB setup (SQLite on mounted disk) ----------
 const DB_PATH = process.env.SQLITE_DB_PATH || "shipments.db";
-
-// Ensure directory exists
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
-
 const db = new Database(DB_PATH);
 
-// Create tables if not exist
+// Base table (minimal)
 db.prepare(`
   CREATE TABLE IF NOT EXISTS shipments (
     id TEXT PRIMARY KEY,
     created_at TEXT,
+    // Header
+    your_partner TEXT,
+    shipper_phone TEXT,
+    shipper_email TEXT,
     shipment_no TEXT,
     order_no TEXT,
-    delivery_no TEXT,
     loading_date TEXT,
     scheduled_delivery_date TEXT,
+    po_no TEXT,
     shipping_point TEXT,
     way_of_forwarding TEXT,
     delivery_terms TEXT,
-    consignee_company TEXT,
+    // "Carrier Notification TO" (forwarder)
+    carrier_to TEXT,
+    // Consignee & customer
     consignee_address TEXT,
+    delivery_no TEXT,
     customer_no TEXT,
     customer_po TEXT,
-    notify_company TEXT,
-    notify_address TEXT,
-    marks_text TEXT,
-    order_label TEXT,
+    customer_contact TEXT,
+    customer_phone TEXT,
+    customer_email TEXT,
+    // Notify parties
+    notify1_address TEXT,
+    notify2_address TEXT,
+    // Goods summary
     total_net_kg REAL,
+    total_gross_kg REAL,
     total_pkgs INTEGER,
-    total_gross_kg REAL
+    // B/L & extra
+    bl_remarks TEXT,
+    hs_code TEXT,
+    signature_name TEXT,
+    signature_date TEXT
   )
 `).run();
 
@@ -50,183 +67,547 @@ db.prepare(`
   CREATE TABLE IF NOT EXISTS items (
     id TEXT PRIMARY KEY,
     shipment_id TEXT,
-    description TEXT,
-    type TEXT,
+    product_name TEXT,
     net_kg REAL,
-    pkgs INTEGER,
     gross_kg REAL,
-    packaging TEXT,
-    pallets INTEGER,
+    pkgs INTEGER,
     FOREIGN KEY (shipment_id) REFERENCES shipments(id) ON DELETE CASCADE
   )
 `).run();
 
+// Safe auto-migrations (add new columns if missing)
+function ensureColumns(table, cols) {
+  const existing = db.prepare(`PRAGMA table_info(${table})`).all();
+  const names = new Set(existing.map(r => r.name));
+  for (const [name, type] of Object.entries(cols)) {
+    if (!names.has(name)) db.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`).run();
+  }
+}
+ensureColumns("shipments", {
+  your_partner: "TEXT",
+  shipper_phone: "TEXT",
+  shipper_email: "TEXT",
+  po_no: "TEXT",
+  carrier_to: "TEXT",
+  customer_contact: "TEXT",
+  customer_phone: "TEXT",
+  customer_email: "TEXT",
+  notify2_address: "TEXT",
+  bl_remarks: "TEXT",
+  hs_code: "TEXT",
+  signature_name: "TEXT",
+  signature_date: "TEXT"
+});
+
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "6mb" }));
 const upload = multer({ storage: multer.memoryStorage() });
 
-/**
- * --- Simple Parser (adapt to your PDFs) ---
- */
-function parseFieldsFromText(text) {
-  const shipment_no = (text.match(/Shipment No.:\s*(\d+)/i) || [])[1] || "";
-  const order_no = (text.match(/Order No.:\s*(\d+)/i) || [])[1] || "";
-  const delivery_no = (text.match(/Delivery No.:\s*(\d+)/i) || [])[1] || "";
-  const loading_date = (text.match(/Loading Date:\s*([\d.]+)/i) || [])[1] || "";
-  const scheduled_delivery_date = (text.match(/Sched. Delivery Date:\s*([\d.]+)/i) || [])[1] || "";
-  const way_of_forwarding = (text.match(/Way of Forwarding:\s*(.+)/i) || [])[1] || "";
-  const delivery_terms = (text.match(/Delivery Terms:\s*(.+)/i) || [])[1] || "";
-  const consignee_company = (text.match(/Delivery Address:\s*([\s\S]*?)Customer No./i) || [])[1] || "";
-  const customer_no = (text.match(/Customer No.:\s*(\S+)/i) || [])[1] || "";
-  const customer_po = (text.match(/Customer PO No.:\s*(.+)/i) || [])[1] || "";
-  const notify_company = (text.match(/Notify:\s*([\s\S]*?)MARKS/i) || [])[1] || "";
-  const marks_text = (text.match(/LABELLING:\s*([\s\S]*?)ORDER/i) || [])[1] || "";
-  const order_label = (text.match(/ORDER No ([A-Za-z0-9/-]+)/i) || [])[1] || "";
+// ---------- Extraction pipeline ----------
+function clean(s) { return (s || "").replace(/\s+[ \t]/g, " ").replace(/[ \t]+\n/g, "\n").trim(); }
+function looksGood(txt) {
+  const keys = ["Shipment No.", "Order No.", "Delivery Terms", "Delivery Address", "Notify", "TOTAL"];
+  const hits = keys.filter(k => txt.includes(k)).length;
+  return hits >= 3 && txt.length > 300;
+}
+function execToString(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(err);
+      resolve(stdout.toString("utf8"));
+    });
+  });
+}
+async function extractTextFromBuffer(pdfBuffer) {
+  try {
+    const a = await pdfParse(pdfBuffer);
+    if (a?.text && looksGood(a.text)) return a.text;
+  } catch (_) {}
 
-  const total = text.match(/TOTAL\s*([\d.,]+)\s*KG\s+(\d+)\s+([\d.,]+)\s*KG/i);
-  const total_net_kg = total ? parseFloat(total[1].replace(",", ".")) : 0;
-  const total_pkgs = total ? parseInt(total[2], 10) : 0;
-  const total_gross_kg = total ? parseFloat(total[3].replace(",", ".")) : 0;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
+  const pdfPath = path.join(tmpDir, "in.pdf");
+  fs.writeFileSync(pdfPath, pdfBuffer);
+
+  try {
+    const txt = await execToString("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
+    if (looksGood(txt)) return txt;
+  } catch (_) {}
+
+  try {
+    await execToString("pdftoppm", ["-r", "300", pdfPath, path.join(tmpDir, "pg"), "-png"]);
+    const pngs = fs.readdirSync(tmpDir).filter(f => f.startsWith("pg-") && f.endsWith(".png")).sort();
+    let ocr = "";
+    for (const p of pngs) {
+      ocr += "\n" + await execToString("tesseract", [path.join(tmpDir, p), "stdout", "--psm", "4"]);
+    }
+    if (ocr.trim().length > 50) return ocr;
+  } catch (_) {}
+
+  return "";
+}
+
+// ---------- Parsing tuned to your sample ----------
+function match(re, text, i = 1) { const m = re.exec(text); return m ? clean(m[i]) : ""; }
+function matchAll(re, text) { const out = []; let m; while ((m = re.exec(text)) !== null) out.push(m); return out; }
+
+function parseFieldsFromText(textRaw) {
+  const text = textRaw.replace(/\r/g, "");
+  const norm = text.replace(/[\t\f]+/g, " ").replace(/ +/g, " ");
+
+  const shipment_no = match(/Shipment No\.\s*([0-9]+)/i, norm);
+  const order_no = match(/Order No\.\s*([0-9]+)/i, norm);
+  const delivery_no = match(/Delivery No\.\s*([0-9]+)/i, norm);
+  const loading_date = match(/Loading Date:\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i, norm);
+  const scheduled_delivery_date = match(/Sched\. Delivery Date:\s*([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i, norm);
+  const way_of_forwarding = match(/Way of Forwarding:\s*([^\n]+?)(?:\s+Delivery Terms:|\s+PRODUCT|\n)/i, text);
+  const delivery_terms = match(/Delivery Terms:\s*([A-Z]+\s+[A-Za-z0-9]+)/i, norm);
+  const your_partner = match(/Your Partner:\s*([^\n]+)/i, text) || match(/Your Partner:\s*([^\n]+)/i, norm);
+  const shipper_phone = match(/Telephone\s*:\s*([^\n]+)/i, text);
+  const shipper_email = match(/Email\s*:\s*([^\s]+)/i, text);
+
+  // "Carrier Notification TO" – try to grab a forwarder block (Expeditors…)
+  let carrier_to = "";
+  const forwarderBlock = /(Expeditors International GmbH[\s\S]{0,200}?(?:GERMANY|GREECE|NORWAY|[A-Z]{3,}))/i.exec(text);
+  if (forwarderBlock) carrier_to = clean(forwarderBlock[1]);
+
+  // Consignee (Delivery Address block until "Customer No.")
+  const consignee_block = match(/Delivery Address:\s*([\s\S]*?)\n\s*Customer No\./i, text);
+  let consignee_address = "";
+  if (consignee_block) {
+    const lines = consignee_block.split("\n").map(l => clean(l)).filter(Boolean);
+    consignee_address = lines.join("\n");
+  }
+  const customer_no = match(/Customer No\.\s*([^\s]+)/i, text);
+  const customer_po = match(/Customer PO No\.\s*([^\n]+)/i, text);
+
+  // Notify (use up to "MARKS TEXT")
+  const notify_block = match(/Notify:\s*([\s\S]*?)\n\s*MARKS TEXT/i, text);
+  let notify1_address = "";
+  if (notify_block) {
+    const lines = notify_block.split("\n")
+      .map(l => clean(l))
+      .filter(Boolean)
+      .filter(l => !/@/.test(l) && !/Tel\./i.test(l) && !/Vat No\./i.test(l));
+    notify1_address = lines.join("\n");
+  }
+
+  // B/L remarks & order label (marks)
+  const bl_remarks = clean(match(/LABELLING:\s*([\s\S]*?)\n\s*ORDER/i, text));
+  const order_label = match(/ORDER\s*No\s*([A-Za-z0-9\/-]+)/i, text);
+
+  // Totals
+  const t = /TOTAL\s*([0-9\.,]+)\s*KG\s*([0-9]+)\s*([0-9\.,]+)\s*KG/i.exec(text);
+  const total_net_kg = t ? parseFloat(t[1].replace(/\./g, "").replace(",", ".")) : null;
+  const total_pkgs = t ? parseInt(t[2], 10) : null;
+  const total_gross_kg = t ? parseFloat(t[3].replace(/\./g, "").replace(",", ".")) : null;
+
+  // Items → Product cards (name, net, gross, pkgs)
+  const itemMatches = matchAll(
+    /(TITANIUM DIOXIDE[^\n]*?Type\s*\S+)[^\n]*?([0-9\.,]+)\s*KG\s+([0-9]+)\s+([0-9\.,]+)\s*KG/gi,
+    text
+  );
+  const items = itemMatches.map(m => {
+    const product_name = clean(m[1]);
+    const net_kg = parseFloat(m[2].replace(/\./g, "").replace(",", ".")) || null;
+    const pkgs = parseInt(m[3], 10) || null;
+    const gross_kg = parseFloat(m[4].replace(/\./g, "").replace(",", ".")) || null;
+    return { product_name, net_kg, gross_kg, pkgs };
+  });
+
+  // Decide PO No: prefer order_label, fallback to customer_po
+  const po_no = order_label || customer_po || "";
 
   return {
-    shipment_no,
-    order_no,
-    delivery_no,
-    loading_date,
-    scheduled_delivery_date,
-    way_of_forwarding,
-    delivery_terms,
-    consignee_company,
-    consignee_address: consignee_company,
-    customer_no,
-    customer_po,
-    notify_company,
-    notify_address: notify_company,
-    marks_text,
-    order_label,
-    total_net_kg,
-    total_pkgs,
-    total_gross_kg,
-    items: [],
+    // Header
+    your_partner, shipper_phone, shipper_email,
+    shipment_no, order_no, loading_date, scheduled_delivery_date, po_no,
+    shipping_point: "", // let user fill; parsing varies
+    way_of_forwarding: clean(way_of_forwarding), delivery_terms: clean(delivery_terms),
+    // Carrier Notification TO
+    carrier_to: clean(carrier_to),
+    // Consignee & customer
+    consignee_address: clean(consignee_address),
+    delivery_no, customer_no, customer_po,
+    customer_contact: "", customer_phone: "", customer_email: "",
+    // Notify parties
+    notify1_address: clean(notify1_address),
+    notify2_address: "",
+    // Goods
+    total_net_kg, total_gross_kg, total_pkgs,
+    // B/L & extras
+    bl_remarks, hs_code: "", signature_name: "", signature_date: dayjs().format("YYYY-MM-DD"),
+    // Products
+    items
   };
 }
 
-// --- Routes ---
-
-// Frontend UI
+// ---------- UI (matches your screenshot layout) ----------
 app.get("/", (_req, res) => {
-  res.type("html").send(`
-  <!doctype html>
-  <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Carrier PDF → Form</title>
-    <style>
-      body { font-family: sans-serif; background:#f5f6f7; padding:20px; }
-      .drop { border:2px dashed #999; padding:20px; margin-bottom:20px; cursor:pointer; }
-      input, textarea { width:100%; margin:5px 0; padding:6px; }
-      button { margin-top:10px; padding:8px 14px; }
-    </style>
-  </head>
-  <body>
-    <h1>Carrier Notification: PDF → Structured Form</h1>
-    <div class="drop" id="drop">Drop PDF here or click<input id="file" type="file" hidden /></div>
-    <div id="status"></div>
-    <form id="form"></form>
+  res.type("html").send(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Carrier Notification Letter</title>
+<style>
+  :root { --border:#E5E7EB; --bg:#F8FAFC; --card:#FFFFFF; --muted:#6B7280; --pri:#2563EB; }
+  *{box-sizing:border-box;font-family:system-ui,Segoe UI,Inter,Roboto,Arial}
+  body{margin:0;background:var(--bg);color:#0f172a}
+  .container{max-width:900px;margin:28px auto;padding:0 16px}
+  h1{font-size:28px;text-align:center;margin:0 0 18px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  label{display:block;font-size:12px;color:#374151;margin:8px 0 4px}
+  input,textarea{width:100%;padding:10px;border-radius:8px;border:1px solid var(--border);background:#fff}
+  textarea{min-height:70px}
+  .section-title{font-weight:600;border-bottom:1px solid var(--border);padding-bottom:6px;margin:6px 0 12px}
+  .muted{color:var(--muted)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .btn{background:var(--pri);color:#fff;border:none;border-radius:8px;padding:12px 14px;cursor:pointer}
+  .btn-link{color:#2563EB;background:transparent;border:none;cursor:pointer;padding:0;margin:8px 0}
+  .drop{border:2px dashed #cbd5e1;border-radius:10px;padding:12px;text-align:center;cursor:pointer}
+  .product{background:#F9FAFB;border:1px solid var(--border);border-radius:8px;padding:12px;margin:8px 0}
+  .product header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .right{display:flex;gap:10px;align-items:center}
+  .footer-row{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:center}
+  .list table{width:100%;border-collapse:collapse}
+  .list th,.list td{border-bottom:1px solid var(--border);padding:8px;text-align:left;font-size:14px}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Carrier Notification Letter</h1>
+
+  <div class="card">
+    <div class="grid2">
+      <div>
+        <div class="section-title">KRONOS TITAN GmbH</div>
+        <div class="muted">Peschstrasse 5, 51373 Leverkusen</div>
+        <div class="muted" style="margin-top:8px">Drag & drop a carrier notification PDF to autofill:</div>
+        <div id="drop" class="drop" style="margin-top:8px">Drop PDF here or click<input id="file" type="file" accept="application/pdf" hidden/></div>
+        <div id="status" class="muted" style="margin-top:8px"></div>
+      </div>
+      <div>
+        <div class="section-title">CARRIER NOTIFICATION TO:</div>
+        <textarea id="carrier_to" placeholder="Expeditors International GmbH\nMönchhofallee 10\n65479 RAUNHEIM\nGERMANY"></textarea>
+      </div>
+    </div>
+
+    <div class="row">
+      <div><label>Your Partner</label><input id="your_partner" placeholder=""/></div>
+      <div><label>Telephone</label><input id="shipper_phone" placeholder=""/></div>
+    </div>
+    <div class="row">
+      <div><label>Email</label><input id="shipper_email" placeholder=""/></div>
+      <div></div>
+    </div>
+
+    <div class="row">
+      <div><label>Shipment No.</label><input id="shipment_no"/></div>
+      <div><label>Order No.</label><input id="order_no"/></div>
+    </div>
+    <div class="row">
+      <div><label>Loading Date</label><input id="loading_date" placeholder="dd.mm.yyyy"/></div>
+      <div><label>Sched. Delivery Date</label><input id="scheduled_delivery_date" placeholder="dd.mm.yyyy"/></div>
+    </div>
+    <div class="row">
+      <div><label>PO No.</label><input id="po_no"/></div>
+      <div><label>Shipping Point</label><textarea id="shipping_point" placeholder="Enter Shipping Point address"></textarea></div>
+    </div>
+    <div class="row">
+      <div><label>Way of Forwarding</label><input id="way_of_forwarding"/></div>
+      <div><label>Delivery Terms</label><input id="delivery_terms"/></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Consignee</div>
+    <textarea id="consignee_address" placeholder="Enter Consignee address"></textarea>
+    <div class="row">
+      <div><label>Delivery No.</label><input id="delivery_no"/></div>
+      <div><label>Customer No.</label><input id="customer_no"/></div>
+    </div>
+    <div class="row">
+      <div><label>Customer PO No.</label><input id="customer_po"/></div>
+      <div><label>Customer Contact</label><input id="customer_contact"/></div>
+    </div>
+    <div class="row">
+      <div><label>Customer Phone Number</label><input id="customer_phone"/></div>
+      <div><label>Customer Email</label><input id="customer_email"/></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Notify Parties</div>
+    <div class="row">
+      <div><label>Notify 1</label><textarea id="notify1_address" placeholder="Enter Notify Party 1 address"></textarea></div>
+      <div><label>Notify 2</label><textarea id="notify2_address" placeholder="Enter Notify Party 2 address"></textarea></div>
+    </div>
+  </div>
+
+  <div class="card" id="goodsCard">
+    <div class="section-title">Goods Information</div>
+    <div id="products"></div>
+    <button class="btn-link" type="button" id="addProduct">+ Add Product</button>
+  </div>
+
+  <div class="card">
+    <div class="section-title">B/L Remarks & Instructions</div>
+    <textarea id="bl_remarks" placeholder=""></textarea>
+    <label style="margin-top:8px">HS Code</label>
+    <input id="hs_code" placeholder=""/>
+  </div>
+
+  <div class="card">
+    <div class="footer-row">
+      <div>
+        <div class="muted">Sincerely,</div>
+        <label>Your Name</label>
+        <input id="signature_name" placeholder="Authorized Signature"/>
+      </div>
+      <div>
+        <label>Date</label>
+        <input id="signature_date"/>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <button class="btn" type="button" id="submitBtn">Submit Notification</button>
+  </div>
+
+  <div class="card list">
+    <div class="section-title">Past Notifications</div>
     <div id="recent"></div>
-  <script>
-    const drop=document.getElementById("drop"), file=document.getElementById("file");
-    drop.addEventListener("click", ()=>file.click());
-    drop.addEventListener("dragover", e=>{e.preventDefault();});
-    drop.addEventListener("drop", e=>{e.preventDefault(); handle(e.dataTransfer.files);});
-    file.addEventListener("change", e=>handle(e.target.files));
-    async function handle(files){
-      const f=files[0]; if(!f) return;
-      const fd=new FormData(); fd.append("file", f);
-      const r=await fetch("/api/upload",{method:"POST",body:fd});
-      const js=await r.json();
-      renderForm(js);
-    }
-    function renderForm(data){
-      const form=document.getElementById("form");
-      form.innerHTML="";
-      for(const k in data){
-        if(k==="items") continue;
-        form.innerHTML+=\`<label>\${k}<input name="\${k}" value="\${data[k]||""}"></label>\`;
-      }
-      form.innerHTML+=\`<button type="button" onclick="save()">Save</button>\`;
-    }
-    async function save(){
-      const fd=new FormData(document.getElementById("form"));
-      const obj={}; fd.forEach((v,k)=>obj[k]=v);
-      const r=await fetch("/api/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj)});
-      const js=await r.json();
-      document.getElementById("status").textContent="Saved "+js.id;
-      loadRecent();
-    }
-    async function loadRecent(){
-      const r=await fetch("/api/shipments"); const js=await r.json();
-      let html="<h2>Recent Shipments</h2><ul>";
-      js.forEach(s=>{html+=\`<li>\${s.created_at}: \${s.shipment_no||""} (\${s.consignee_company||""})</li>\`;});
-      html+="</ul>"; document.getElementById("recent").innerHTML=html;
-    }
+  </div>
+</div>
+
+<script>
+  const $ = sel => document.querySelector(sel);
+  const statusEl = $("#status");
+  const prodWrap = $("#products");
+
+  // product card component
+  function makeProductCard(idx, data={}){
+    const div = document.createElement("div");
+    div.className = "product";
+    div.innerHTML = \`
+      <header>
+        <strong>Product \${idx+1}</strong>
+        <button class="btn-link" type="button">Remove Product</button>
+      </header>
+      <label>Product Name</label>
+      <input name="product_name" value="\${data.product_name||""}">
+      <div class="row">
+        <div><label>Net Weight (KG)</label><input name="net_kg" value="\${data.net_kg??""}"></div>
+        <div><label>Gross Weight (KG)</label><input name="gross_kg" value="\${data.gross_kg??""}"></div>
+      </div>
+      <div class="row">
+        <div><label>No. Packages</label><input name="pkgs" value="\${data.pkgs??""}"></div>
+        <div></div>
+      </div>
+    \`;
+    const removeBtn = div.querySelector("button");
+    removeBtn.onclick = () => { div.remove(); renumberProducts(); };
+    return div;
+  }
+  function renumberProducts(){
+    [...prodWrap.querySelectorAll(".product header strong")].forEach((h,i)=>h.textContent="Product "+(i+1));
+  }
+  function addProduct(data){ prodWrap.appendChild(makeProductCard(prodWrap.children.length, data)); }
+
+  // Upload handlers
+  const drop = $("#drop"), file = $("#file");
+  drop.addEventListener("click", ()=>file.click());
+  drop.addEventListener("dragover", e=>{ e.preventDefault(); });
+  drop.addEventListener("drop", e=>{ e.preventDefault(); handleFiles(e.dataTransfer.files); });
+  file.addEventListener("change", e=>handleFiles(e.target.files));
+
+  async function handleFiles(files){
+    const f = files[0]; if (!f) return;
+    statusEl.textContent = "Uploading & extracting…";
+    const fd = new FormData(); fd.append("file", f);
+    const r = await fetch("/api/upload", { method:"POST", body: fd });
+    const js = await r.json();
+    if(!r.ok){ statusEl.textContent = js.error || "Failed to parse"; return; }
+    statusEl.textContent = "Parsed. Review the form and submit.";
+    fillForm(js);
+  }
+
+  function setVal(id, val){ const el = document.getElementById(id); if(el) el.value = val || ""; }
+
+  function fillForm(d){
+    setVal("carrier_to", d.carrier_to);
+    setVal("your_partner", d.your_partner);
+    setVal("shipper_phone", d.shipper_phone);
+    setVal("shipper_email", d.shipper_email);
+
+    setVal("shipment_no", d.shipment_no);
+    setVal("order_no", d.order_no);
+    setVal("loading_date", d.loading_date);
+    setVal("scheduled_delivery_date", d.scheduled_delivery_date);
+    setVal("po_no", d.po_no);
+    setVal("shipping_point", d.shipping_point);
+    setVal("way_of_forwarding", d.way_of_forwarding);
+    setVal("delivery_terms", d.delivery_terms);
+
+    setVal("consignee_address", d.consignee_address);
+    setVal("delivery_no", d.delivery_no);
+    setVal("customer_no", d.customer_no);
+    setVal("customer_po", d.customer_po);
+    setVal("customer_contact", d.customer_contact);
+    setVal("customer_phone", d.customer_phone);
+    setVal("customer_email", d.customer_email);
+
+    setVal("notify1_address", d.notify1_address);
+    setVal("notify2_address", d.notify2_address);
+
+    setVal("bl_remarks", d.bl_remarks);
+    setVal("hs_code", d.hs_code);
+    setVal("signature_name", d.signature_name);
+    setVal("signature_date", d.signature_date || new Date().toISOString().slice(0,10));
+
+    // products
+    prodWrap.innerHTML = "";
+    (d.items || [{},{}]).forEach(it => addProduct(it)); // show at least 2 product cards
     loadRecent();
-  </script>
-  </body>
-  </html>
-  `);
+  }
+
+  $("#addProduct").onclick = () => addProduct({});
+
+  $("#submitBtn").onclick = async () => {
+    const body = {
+      carrier_to: $("#carrier_to").value,
+      your_partner: $("#your_partner").value,
+      shipper_phone: $("#shipper_phone").value,
+      shipper_email: $("#shipper_email").value,
+
+      shipment_no: $("#shipment_no").value,
+      order_no: $("#order_no").value,
+      loading_date: $("#loading_date").value,
+      scheduled_delivery_date: $("#scheduled_delivery_date").value,
+      po_no: $("#po_no").value,
+      shipping_point: $("#shipping_point").value,
+      way_of_forwarding: $("#way_of_forwarding").value,
+      delivery_terms: $("#delivery_terms").value,
+
+      consignee_address: $("#consignee_address").value,
+      delivery_no: $("#delivery_no").value,
+      customer_no: $("#customer_no").value,
+      customer_po: $("#customer_po").value,
+      customer_contact: $("#customer_contact").value,
+      customer_phone: $("#customer_phone").value,
+      customer_email: $("#customer_email").value,
+
+      notify1_address: $("#notify1_address").value,
+      notify2_address: $("#notify2_address").value,
+
+      bl_remarks: $("#bl_remarks").value,
+      hs_code: $("#hs_code").value,
+      signature_name: $("#signature_name").value,
+      signature_date: $("#signature_date").value,
+
+      items: [...prodWrap.querySelectorAll(".product")].map(div => ({
+        product_name: div.querySelector('input[name="product_name"]').value,
+        net_kg: parseFloat(div.querySelector('input[name="net_kg"]').value || 0) || null,
+        gross_kg: parseFloat(div.querySelector('input[name="gross_kg"]').value || 0) || null,
+        pkgs: parseInt(div.querySelector('input[name="pkgs"]').value || 0) || null
+      }))
+    };
+
+    const r = await fetch("/api/save", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
+    const js = await r.json();
+    if (r.ok) { statusEl.textContent = "Saved. ID: " + js.id; loadRecent(); }
+    else { statusEl.textContent = js.error || "Save failed"; }
+  };
+
+  async function loadRecent(){
+    const r = await fetch("/api/shipments");
+    const rows = await r.json();
+    let h = '<table><thead><tr><th>Created</th><th>Shipment No.</th><th>Order No.</th><th>Consignee</th><th>Total Net (kg)</th></tr></thead><tbody>';
+    (rows||[]).forEach(s => {
+      h += \`<tr><td>\${s.created_at}</td><td>\${s.shipment_no||""}</td><td>\${s.order_no||""}</td><td>\${(s.consignee_address||"").split("\\n")[0]||""}</td><td>\${s.total_net_kg??""}</td></tr>\`;
+    });
+    h += "</tbody></table>";
+    $("#recent").innerHTML = h;
+  }
+  // Initial state
+  fillForm({ signature_date: new Date().toISOString().slice(0,10) });
+</script>
+</body></html>`);
 });
 
-// Upload & parse PDF
+// ---------- API ----------
 app.post("/api/upload", upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file" });
   try {
-    const pdfData = await pdfParse(req.file.buffer);
-    const parsed = parseFieldsFromText(pdfData.text || "");
-    res.json(parsed);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Parse failed" });
+    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    if (req.file.mimetype !== "application/pdf") return res.status(400).json({ error: "Only PDF supported" });
+    const text = await extractTextFromBuffer(req.file.buffer);
+    if (!text) return res.status(422).json({ error: "Unable to extract text (try a clearer PDF)" });
+    res.json(parseFieldsFromText(text));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to parse PDF" });
   }
 });
 
-// Save to DB
 app.post("/api/save", (req, res) => {
+  const s = req.body || {};
+  const id = nanoid();
+  const created_at = dayjs().toISOString();
   try {
-    const s = req.body;
-    const id = nanoid();
-    const created_at = dayjs().toISOString();
     db.prepare(`
       INSERT INTO shipments (
-        id, created_at, shipment_no, order_no, delivery_no, loading_date,
-        scheduled_delivery_date, shipping_point, way_of_forwarding, delivery_terms,
-        consignee_company, consignee_address, customer_no, customer_po,
-        notify_company, notify_address, marks_text, order_label,
-        total_net_kg, total_pkgs, total_gross_kg
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        id, created_at, your_partner, shipper_phone, shipper_email,
+        shipment_no, order_no, loading_date, scheduled_delivery_date, po_no,
+        shipping_point, way_of_forwarding, delivery_terms,
+        carrier_to, consignee_address, delivery_no, customer_no, customer_po,
+        customer_contact, customer_phone, customer_email,
+        notify1_address, notify2_address,
+        total_net_kg, total_gross_kg, total_pkgs,
+        bl_remarks, hs_code, signature_name, signature_date
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      id, created_at, s.shipment_no, s.order_no, s.delivery_no, s.loading_date,
-      s.scheduled_delivery_date, s.shipping_point, s.way_of_forwarding, s.delivery_terms,
-      s.consignee_company, s.consignee_address, s.customer_no, s.customer_po,
-      s.notify_company, s.notify_address, s.marks_text, s.order_label,
-      s.total_net_kg, s.total_pkgs, s.total_gross_kg
+      id, created_at, s.your_partner, s.shipper_phone, s.shipper_email,
+      s.shipment_no, s.order_no, s.loading_date, s.scheduled_delivery_date, s.po_no,
+      s.shipping_point, s.way_of_forwarding, s.delivery_terms,
+      s.carrier_to, s.consignee_address, s.delivery_no, s.customer_no, s.customer_po,
+      s.customer_contact, s.customer_phone, s.customer_email,
+      s.notify1_address, s.notify2_address,
+      s.total_net_kg ?? null, s.total_gross_kg ?? null, s.total_pkgs ?? null,
+      s.bl_remarks, s.hs_code, s.signature_name, s.signature_date
     );
+
+    const insItem = db.prepare(`
+      INSERT INTO items (id, shipment_id, product_name, net_kg, gross_kg, pkgs)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    (Array.isArray(s.items) ? s.items : []).forEach(it => {
+      insItem.run(nanoid(), id, it.product_name || null, it.net_kg ?? null, it.gross_kg ?? null, it.pkgs ?? null);
+    });
+
     res.json({ id });
-  } catch (err) {
-    console.error(err);
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: "Save failed" });
   }
 });
 
-// List shipments
 app.get("/api/shipments", (_req, res) => {
   try {
-    const rows = db.prepare("SELECT * FROM shipments ORDER BY created_at DESC LIMIT 20").all();
+    const rows = db.prepare(`
+      SELECT s.*, (SELECT COUNT(*) FROM items i WHERE i.shipment_id = s.id) as item_count
+      FROM shipments s
+      ORDER BY datetime(s.created_at) DESC
+      LIMIT 100
+    `).all();
     res.json(rows);
-  } catch (err) {
+  } catch (e) {
+    console.error(e);
     res.status(500).json({ error: "DB failed" });
   }
 });
 
+// ---------- Start ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Listening on :" + PORT));
