@@ -198,36 +198,64 @@ function parseShippingPoint(block) {
 }
 
 // ------------------ PARSER (more tolerant to label variants) ------------------
+// Grab a value that appears close to a label (even if it's on the next line)
+function grabNear(labelRe, valueRe, text, windowChars = 120) {
+  const m = labelRe.exec(text);
+  if (!m) return "";
+  const start = Math.max(0, m.index);
+  const end   = Math.min(text.length, m.index + m[0].length + windowChars);
+  const seg   = text.slice(start, end);
+  const mv    = valueRe.exec(seg);
+  if (!mv) return "";
+  // Prefer capture group 1 if provided, else whole match
+  return clean(mv[1] ?? mv[0]);
+}
+
+// Grab 1–N lines after a label until a stop word appears
+function grabBlock(labelRe, stopRes, text, maxLines = 8) {
+  const m = labelRe.exec(text);
+  if (!m) return "";
+  const tail = text.slice(m.index + m[0].length);
+  const lines = tail.split("\n").map(l => clean(l));
+  const out = [];
+  for (const line of lines) {
+    if (!line) break; // stop on first blank line
+    if (stopRes.some(r => r.test(line))) break;
+    out.push(line);
+    if (out.length >= maxLines) break;
+  }
+  return out.join("\n");
+}
 function parseFieldsFromText(textRaw) {
-  // Normalize once; use `full` everywhere so we never rely on a free `text` var
   const full = clean(textRaw).replace(/\r/g, "");
   const norm = full.replace(/[\t\f]+/g, " ");
 
-  // Helpers for common label variants
   const RE_NO    = String.raw`No\.?`;
-  const RE_DATE  = String.raw`([0-9]{2}[.\-\/][0-9]{2}[.\-\/][0-9]{2,4})`;
-  const takeLine = String.raw`([^\n]+)`;
+  const RE_DATE  = /([0-9]{2}[.\-\/][0-9]{2}[.\-\/][0-9]{2,4})/;
 
-  // IDs & dates (tolerant)
-  const shipment_no = match(new RegExp(`Shipment\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), full) ||
-                      match(/Shipping\s*Note\s*[:\-]\s*([0-9A-Za-z\-]+)/i, full) || "";
-  const order_no    = match(new RegExp(`Order\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), full) || "";
-  const delivery_no = match(new RegExp(`Delivery\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), full) || "";
+  // IDs & dates — tolerate values on the next line or a few chars after the label
+  const shipment_no = match(new RegExp(`Shipment\\s*${RE_NO}[.:\\-]?\\s*([0-9A-Za-z\\-]+)`, "i"), full)
+                   || grabNear(/Shipment\s*No/i, /([0-9A-Za-z\-]+)/i, full, 150) || "";
 
-  const loading_date =
-    match(new RegExp(`Loading\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), full) ||
-    match(/Loading\s*Date[.:\-]?\s*([0-9.\/-]+)/i, full) || "";
+  const order_no    = match(new RegExp(`Order\\s*${RE_NO}[.:\\-]?\\s*([0-9A-Za-z\\-]+)`, "i"), full)
+                   || grabNear(/Order\s*No/i, /([0-9A-Za-z\-]+)/i, full, 150) || "";
+
+  const delivery_no = match(new RegExp(`Delivery\\s*${RE_NO}[.:\\-]?\\s*([0-9A-Za-z\\-]+)`, "i"), full)
+                   || grabNear(/Delivery\s*No/i, /([0-9A-Za-z\-]+)/i, full, 150) || "";
+
+  const loading_date = match(/Loading\s*Date[.:\-]?\s*([0-9.\/-]+)/i, full)
+                    || grabNear(/Loading\s*Date/i, RE_DATE, full, 80) || "";
 
   const scheduled_delivery_date =
-    match(new RegExp(`Sched(?:uled)?\\s*Delivery\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), full) ||
-    match(/Scheduled\s*Delivery\s*Date[.:\-]?\s*([0-9.\/-]+)/i, full) || "";
+        match(/Sched(?:uled)?\s*Delivery\s*Date[.:\-]?\s*([0-9.\/-]+)/i, full)
+     || grabNear(/Sched(?:uled)?\s*Delivery\s*Date/i, RE_DATE, full, 80) || "";
 
   // Header contacts
   const your_partner = match(/Your\s*Partner[.:\-]?\s*([^\n]+)/i, norm);
-  let   shipper_phone = match(/(?:Telephone|Phone)[.:\-]?\s*([^\n]+)/i, full);
-  shipper_phone = shipper_phone ? shipper_phone.replace(/^[^\d+]+/, "").trim() : "";
-  let   shipper_email = findEmail(match(/Email[.:\-]?\s*([^\n]+)/i, full) || "") ||
-                        findEmail(full.slice(Math.max(0, (full.indexOf("Email")||0) - 30), (full.indexOf("Email")||0) + 120));
+  let shipper_phone  = match(/(?:Telephone|Phone)[.:\-]?\s*([^\n]+)/i, full);
+  shipper_phone      = shipper_phone ? shipper_phone.replace(/^[^\d+]+/, "").trim() : "";
+  let shipper_email  = findEmail(match(/Email[.:\-]?\s*([^\n]+)/i, full) || "")
+                    || findEmail(full.slice(0, 2000)) || "";
 
   // Way of forwarding / Incoterms
   const way_of_forwarding =
@@ -235,7 +263,7 @@ function parseFieldsFromText(textRaw) {
   const delivery_terms =
     match(/(?:Delivery\s*Terms|Incoterms)[.:\-]?\s*([A-Z0-9 .\-]+)/i, norm) || "";
 
-  // Carrier “TO” block (common pattern)
+  // Carrier TO (common case)
   let carrier_to = "";
   const carrierBlock = /(Expeditors International GmbH[\s\S]{0,200}?(?:GERMANY|USA|GREECE|NORWAY|[A-Z]{3,}))/i.exec(full);
   if (carrierBlock) carrier_to = clean(carrierBlock[1]);
@@ -244,19 +272,20 @@ function parseFieldsFromText(textRaw) {
   const spBlock = match(/Shipping\s*Point(?:\s*address)?[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:Way of Forwarding|Delivery Terms|PRODUCT|Delivery Address|Consignee|Customer))/i, full);
   const sp = parseShippingPoint(spBlock);
 
-  // Consignee (avoid picking up Shipping Point)
+  // Consignee / Delivery Address
   let consignee_address = "";
   let consignee_block = match(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]*?)\n\s*Customer\s*No/i, full);
   if (!consignee_block) {
-    const m = /(?:Delivery\s*Address|Consignee)[.:\-]?\s*\n([\s\S]{0,400})/i.exec(full);
-    if (m) consignee_block = m[1];
+    consignee_block = grabBlock(
+      /(?:Delivery\s*Address|Consignee)[.:\-]?\s*/i,
+      [/Customer\s*No/i, /Notify/i, /Marks/i, /Way of/i, /Shipping\s*Point/i],
+      full,
+      10
+    );
   }
   if (consignee_block) {
-    const lines = consignee_block.split("\n").map(l => clean(l)).filter(Boolean);
-    const COMPANY_HINT = /(GMBH|LTD|LLC|INC|AG|G\.?M\.?B\.?H\.?|KRONOS|SCHMIDT|KATOEN|COVESTRO)/i;
-    const addrLines = (lines.length > 1 && COMPANY_HINT.test(lines[0])) ? lines.slice(1) : lines;
-
-    let addr = addrLines.join("\n");
+    let addr = consignee_block.split("\n").map(l => clean(l)).filter(Boolean).join("\n");
+    // If we accidentally grabbed a plant address, try another occurrence
     if (/NORDENHAM|LEVERKUSEN|NIEHL|MOLENKOPF/i.test(addr)) {
       const all = matchAll(/(?:Delivery\s*Address|Consignee)[.:\-]?\s*([\s\S]{0,300})/gi, full);
       for (const mm of all) {
@@ -267,7 +296,7 @@ function parseFieldsFromText(textRaw) {
     consignee_address = clean(addr);
   }
 
-  const customer_no = match(new RegExp(`Customer\\s*${RE_NO}[.:\\-]?\\s*${takeLine}`, "i"), full);
+  const customer_no = match(new RegExp(`Customer\\s*${RE_NO}[.:\\-]?\\s*([^\n]+)`, "i"), full);
   const customer_po = match(/Customer\s*PO\s*No[.:\-]?\s*([^\n]+)/i, full);
 
   // Notify 1
@@ -303,9 +332,7 @@ function parseFieldsFromText(textRaw) {
   const bl_remarks1 = clean(match(/B\/L\s*REMARKS[.:\-]?\s*([\s\S]*?)(?:\n\s*HS\s*CODE|(?:\n\s*MARKS)|\n\s*KRONOS|$)/i, full));
   const bl_express  = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, full);
   const bl_remarks  = bl_remarks1 || bl_express || "";
-
-  const hs_code_raw = match(/HS\s*CODE[.:\-]?\s*([0-9 ]{4,})/i, full);
-  const hs_code     = (hs_code_raw || "").replace(/\s+/g, "");
+  const hs_code     = (match(/HS\s*CODE[.:\-]?\s*([0-9 ]{4,})/i, full) || "").replace(/\s+/g, "");
 
   const order_label = match(/ORDER\s*No[.:\-]?\s*([A-Za-z0-9\/-]+)/i, full);
 
@@ -334,13 +361,13 @@ function parseFieldsFromText(textRaw) {
   const po_no_explicit = match(/PO\s*No[.:\-]?\s*([A-Za-z0-9/ -]+)/i, full);
   const po_no = (order_label || po_no_explicit || customer_po || "").trim();
 
-  // Optional customer contact block (e.g., Covestro)
+  // Optional explicit customer-contact block (e.g., Covestro)
   let customer_contact = match(/\n([A-Z][A-Z ]{2,})\nPHONE:\s*[^\n]+\nEMAIL:\s*[^\n]+/i, full);
   customer_contact = clean(customer_contact);
   let contact_phone = match(/PHONE:\s*([^\n]+)/i, full);
   let contact_email = findEmail(match(/EMAIL:\s*([^\n]+)/i, full));
 
-  // Final tidy for a few fields that sometimes carry a leading ":" or "-"
+  // Tidy a few fields that sometimes have a leading ":" or "-"
   function trimColon(s){ return (s||"").replace(/^\s*[:\-]+/, "").trim(); }
   const _your_partner = trimColon(your_partner);
   const _customer_po  = trimColon(customer_po);
@@ -350,17 +377,19 @@ function parseFieldsFromText(textRaw) {
     your_partner: _your_partner,
     shipper_phone,
     shipper_email,
+
     shipment_no,
     order_no,
     delivery_no,
     loading_date,
     scheduled_delivery_date,
+
     po_no,
     order_label: _order_label,
 
     shipping_street: sp.street,
     shipping_postal: sp.postal,
-    shipping_city: sp.city,
+    shipping_city:   sp.city,
     shipping_country: sp.country,
 
     way_of_forwarding: clean(way_of_forwarding),
@@ -395,6 +424,7 @@ function parseFieldsFromText(textRaw) {
     items
   };
 }
+
 
 
 // ---------- UI ----------
