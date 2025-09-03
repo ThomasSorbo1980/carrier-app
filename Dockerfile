@@ -1,19 +1,19 @@
-FROM node:20-bullseye
+FROM node:20-slim
 
-# Build tools + PDF/ OCR utilities
-RUN apt-get update && apt-get install -y \
-  python3 make g++ \
-  poppler-utils \
-  tesseract-ocr \
-  && rm -rf /var/lib/apt/lists/*
+# System deps for extraction
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    poppler-utils \            # pdftotext, pdftoppm
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    imagemagick \              # 'convert' for deskew/denoise
+ && rm -rf /var/lib/apt/lists/*
 
+# App setup
 WORKDIR /app
-
 COPY package*.json ./
-RUN npm install --omit=dev
-
+RUN npm ci --omit=dev
 COPY . .
 
-# Do NOT set PORT; Render provides it
+ENV NODE_ENV=production PORT=3000
 EXPOSE 3000
-CMD ["node","dragdrop-pdf-carrier-instruction-app.js"]
+CMD ["node", "dragdrop-pdf-carrier-instruction-app.js"]
