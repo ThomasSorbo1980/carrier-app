@@ -3,6 +3,17 @@
  * PDF → Autofill form → Save to SQLite (Render disk)
  * Extraction pipeline: pdf-parse → pdftotext -layout → Tesseract OCR (fallback)
  */
+const crypto = require("crypto");
+
+// cache table (hash of PDF -> raw text + parsed JSON)
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS cache (
+    hash TEXT PRIMARY KEY,
+    text TEXT,
+    parsed TEXT,
+    created_at TEXT
+  )
+`).run();
 
 const express = require("express");
 const multer = require("multer");
@@ -114,6 +125,24 @@ app.use(express.json({ limit: "8mb" }));
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ---------- Extraction helpers (robust) ----------
+function validateAndScore(f) {
+  let score = 0;
+  const warn = [];
+  const has = k => f[k] && String(f[k]).trim().length > 0;
+
+  if (has("shipment_no") && /\d{6,}/.test(f.shipment_no)) score += 15; else warn.push("Shipment No missing/short");
+  if (has("order_no")    && /\d{6,}/.test(f.order_no))     score += 10;
+  if (has("loading_date") && /\d{2}[./-]\d{2}[./-]\d{2,4}/.test(f.loading_date)) score += 8; else warn.push("Loading date missing");
+  if (has("scheduled_delivery_date") && /\d{2}[./-]\d{2}[./-]\d{2,4}/.test(f.scheduled_delivery_date)) score += 6;
+  if (has("consignee_address") && f.consignee_address.split("\n").length >= 2) score += 15; else warn.push("Consignee address incomplete");
+  if (Array.isArray(f.items) && f.items.length > 0) score += 10;
+  if (f.total_net_kg && f.total_gross_kg && f.total_gross_kg >= f.total_net_kg) score += 10; else warn.push("Totals inconsistent/missing");
+  if (has("hs_code") && /\d{6,8}/.test(f.hs_code)) score += 5;
+
+  score = Math.max(5, Math.min(100, score)); // clamp
+  return { score, warnings: warn };
+}
+
 function clean(s) {
   return (s || "")
     .replace(/\u00A0/g, " ")              // NBSP -> space
@@ -139,32 +168,65 @@ function execToString(cmd, args) {
   });
 }
 async function extractTextFromBuffer(pdfBuffer) {
-  // 1) pdf-parse
-  try {
-    const a = await pdfParse(pdfBuffer);
-    if (a?.text && looksGood(a.text)) return a.text;
-  } catch (_) {}
-
-  // 2) pdftotext -layout
-  const os = require("os"), path = require("path"), fs = require("fs");
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
-  const pdfPath = path.join(tmpDir, "in.pdf");
+  // write once to disk for CLI tools
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
+  const pdfPath = path.join(tmp, "input.pdf");
   fs.writeFileSync(pdfPath, pdfBuffer);
-  try {
-    const txt = await execToString("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
-    if (looksGood(txt)) return txt;
-  } catch (_) {}
 
-  // 3) OCR fallback
-  try {
-    await execToString("pdftoppm", ["-r", "300", pdfPath, path.join(tmpDir, "pg"), "-png"]);
-    const pngs = fs.readdirSync(tmpDir).filter(f => f.startsWith("pg-") && f.endsWith(".png")).sort();
-    let ocr = "";
-    for (const p of pngs) ocr += "\n" + await execToString("tesseract", [path.join(tmpDir, p), "stdout", "--psm", "4"]);
-    if (ocr.trim().length > 50) return ocr;
-  } catch (_) {}
+  // helper: run a command and return stdout
+  const run = (cmd, args) => new Promise((res) => {
+    execFile(cmd, args, { maxBuffer: 50 * 1024 * 1024 }, (err, out) => res(err ? "" : out.toString("utf8")));
+  });
 
-  return "";
+  // pdf-parse
+  const pPdfParse = (async () => {
+    try { const a = await pdfParse(pdfBuffer); return a?.text || ""; } catch { return ""; }
+  })();
+
+  // pdftotext -layout
+  const pPdftotext = run("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
+
+  // OCR path with pre-processing (deskew/denoise)
+  const pOCR = (async () => {
+    try {
+      // 1) pdf -> pngs
+      await run("pdftoppm", ["-r", "300", pdfPath, path.join(tmp, "pg"), "-png"]);
+      const pngs = fs.readdirSync(tmp).filter(f => f.startsWith("pg-") && f.endsWith(".png")).sort();
+      if (!pngs.length) return "";
+      let ocrText = "";
+      for (const f of pngs) {
+        const inP = path.join(tmp, f), outP = path.join(tmp, "prep-" + f);
+        // deskew + grayscale + light denoise/sharpen
+        await run("convert", [inP, "-deskew", "40%", "-strip", "-colorspace", "Gray",
+                              "-contrast-stretch", "1%x1%", "-brightness-contrast", "10x15",
+                              "-sharpen", "0x1", outP]);
+        ocrText += "\n" + await run("tesseract", [outP, "stdout", "--psm", "4"]);
+      }
+      return ocrText;
+    } catch { return ""; }
+  })();
+
+  // wait for all, then pick best by score
+  const [t1, t2, t3] = await Promise.all([pPdfParse, pPdftotext, pOCR]);
+  const candidates = [t1, t2, t3].filter(Boolean);
+  if (!candidates.length) return "";
+
+  const best = candidates
+    .map(t => ({ t, score: scoreText(t) }))
+    .sort((a, b) => b.score - a.score)[0].t;
+
+  return best;
+}
+
+// heuristic scoring: keywords + numbers + dates + size
+function scoreText(txt) {
+  if (!txt) return 0;
+  const keys = ["Shipment", "Order", "Delivery", "Delivery Address", "Notify", "TOTAL", "Way of Forwarding"];
+  const keyHits = keys.reduce((n, k) => n + (txt.includes(k) ? 1 : 0), 0);
+  const numbers = (txt.match(/\b\d{5,}\b/g) || []).length;
+  const dates = (txt.match(/\b\d{2}[./-]\d{2}[./-]\d{2,4}\b/g) || []).length;
+  const lenScore = Math.min(20, Math.floor(txt.length / 2000));
+  return keyHits * 10 + Math.min(20, numbers) + Math.min(10, dates) + lenScore;
 }
 
 function match(re, text, i = 1) { const m = re.exec(text); return m ? clean(m[i]) : ""; }
@@ -661,13 +723,17 @@ async function handleFiles(files){
       return;
     }
 
-    statusEl.textContent = "Parsed. Review the form and submit.";
+    var conf = (typeof js.confidence === "number") ? (" (confidence " + Math.round(js.confidence) + "%)") : "";
+    var warn = (js.warnings && js.warnings.length) ? " — Check: " + js.warnings.join("; ") : "";
+    statusEl.textContent = "Parsed" + conf + ". Review the form." + warn;
+
     fillForm(js);
   } catch (err) {
     statusEl.textContent = "Network/timeout: " + err.message;
     console.error(err);
   }
 }
+
 
 function setVal(id, val){ var el = document.getElementById(id); if(el) el.value = val || ""; }
 
@@ -800,25 +866,38 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    // Some browsers send application/octet-stream; accept anything and try to parse.
-    const mt = req.file.mimetype || "";
-    if (!/pdf/i.test(mt)) {
-      console.warn("Upload mimetype wasn't PDF:", mt);
+    const hash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
+
+    // Cache hit?
+    const cached = db.prepare("SELECT parsed FROM cache WHERE hash = ?").get(hash);
+    if (cached?.parsed) {
+      const parsed = JSON.parse(cached.parsed);
+      return res.json(parsed);
     }
 
+    // Extract best text in parallel
     const text = await extractTextFromBuffer(req.file.buffer);
     if (!text || !text.trim()) {
-      return res.status(422).json({ error: "Unable to extract text (try a clearer PDF or use /api/debug-text to see what I read)" });
+      return res.status(422).json({ error: "Unable to extract text (try /api/debug-text to inspect raw text)" });
     }
 
+    // Parse + score
     const fields = parseFieldsFromText(text);
-    res.setHeader("Content-Type", "application/json");
-    res.status(200).send(JSON.stringify(fields));
+    const { score, warnings } = validateAndScore(fields);
+    fields.confidence = score;
+    fields.warnings = warnings;
+
+    // Cache store
+    db.prepare("INSERT OR REPLACE INTO cache (hash, text, parsed, created_at) VALUES (?, ?, ?, ?)")
+      .run(hash, text, JSON.stringify(fields), new Date().toISOString());
+
+    res.json(fields);
   } catch (err) {
     console.error("Upload failed:", err);
     res.status(500).json({ error: "Server error: " + (err.message || "unknown") });
   }
 });
+
 
 
 // PATCH B — DEBUG ENDPOINT (paste here ↓)
