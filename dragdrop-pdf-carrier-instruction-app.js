@@ -213,7 +213,12 @@ function parseFieldsFromText(textRaw) {
 
   const loading_date = match(new RegExp(`Loading\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), norm);
   const scheduled_delivery_date = match(new RegExp(`Sched(?:uled)?\\s*Delivery\\s*Date[.:\\-]?\\s*${RE_DATE}`, "i"), norm);
+// NEW: always define these two, tolerate label variants
+const way_of_forwarding =
+  match(/Way\s*of\s*Forwarding[.:\-]?\s*([^\n]+?)(?=\s+(?:Delivery\s*Terms|PRODUCT|\n)|$)/i, text) || "";
 
+const delivery_terms =
+  match(/(?:Delivery\s*Terms|Incoterms)[.:\-]?\s*([A-Z0-9 .\-]+)/i, norm) || "";
   const your_partner  = match(/Your\s*Partner[.:\-]?\s*([^\n]+)/i, norm);
   const shipper_phone = match(/(?:Telephone|Phone)[.:\-]?\s*([^\n]+)/i, norm);
   const shipper_email = match(/Email[.:\-]?\s*([^\s]+)/i, norm);
@@ -272,8 +277,8 @@ function parseFieldsFromText(textRaw) {
   const bl_express  = match(/PLEASE\s+ISSUE\s+EXPRESS\s+B\/L[^\n]*/i, text);
   const bl_remarks  = bl_remarks1 || bl_express || "";
 
-  const hs_code_raw = match(/HS\s*CODE[.:\-]?\s*([0-9 ]{4,})/i, text);
-  const hs_code     = hs_code_raw.replace(/\s+/g, "");
+const hs_code_raw = match(/HS\s*CODE[.:\-]?\s*([0-9 ]{4,})/i, text);
+const hs_code     = (hs_code_raw || "").replace(/\s+/g, "");
 
   const order_label = match(/ORDER\s*No[.:\-]?\s*([A-Za-z0-9\/-]+)/i, text);
 
