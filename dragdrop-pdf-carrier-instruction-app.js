@@ -1,7 +1,6 @@
 /**
- * Carrier Notification Letter
- * PDF → Autofill form → Save to SQLite (Render disk-ready)
- * Extraction: pdf-parse + pdftotext -layout + Tesseract OCR
+ * Carrier Notification Letter (with Drafts, Comments, Freeze)
+ * - PDF → Draft v1 (server) → Review w/ comments → Freeze → Final shipment
  */
 
 const express = require("express");
@@ -91,6 +90,37 @@ db.prepare(`
   )
 `).run();
 
+/* NEW: Draft versions of a shipment before freezing */
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS drafts (
+    id TEXT PRIMARY KEY,
+    base_hash TEXT,           -- PDF hash to dedupe
+    version_no INTEGER,       -- starts at 1
+    status TEXT,              -- 'draft' | 'frozen'
+    data_json TEXT,           -- serialized fields object (incl. items)
+    created_at TEXT,
+    updated_at TEXT
+  )
+`).run();
+
+db.prepare(`
+  CREATE UNIQUE INDEX IF NOT EXISTS ix_drafts_hash_ver
+  ON drafts (base_hash, version_no)
+`).run();
+
+/* NEW: Per-field comments for a draft */
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS comments (
+    id TEXT PRIMARY KEY,
+    draft_id TEXT,
+    field_name TEXT,
+    message TEXT,
+    author TEXT,
+    created_at TEXT,
+    FOREIGN KEY (draft_id) REFERENCES drafts(id) ON DELETE CASCADE
+  )
+`).run();
+
 // auto-migrate (idempotent)
 function ensureColumns(table, cols) {
   const existing = db.prepare(`PRAGMA table_info(${table})`).all();
@@ -121,7 +151,6 @@ ensureColumns("items", { packaging: "TEXT", pallets: "INTEGER" });
 const app = express();
 app.use(express.json({ limit: "8mb" }));
 app.use(express.urlencoded({ extended: true }));
-
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ---------- Helpers ----------
@@ -278,13 +307,15 @@ async function extractTextFromBuffer(pdfBuffer) {
   const pPdftotext = run("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
   const pOCR = (async () => {
     try {
-      const ppmPrefix = path.join(tmp, "pg");
+      const ppmPrefix = path.join(os.tmpdir(), "carrier-" + nanoid());
       await run("pdftoppm", ["-r", "300", pdfPath, ppmPrefix, "-png"]);
-      const pngs = fs.readdirSync(tmp).filter(f => /^pg-\d+\.png$/i.test(f)).sort();
+      const dir = path.dirname(ppmPrefix);
+      const base = path.basename(ppmPrefix);
+      const pngs = fs.readdirSync(dir).filter(f => f.startsWith(base) && f.endsWith(".png")).sort();
       if (!pngs.length) return "";
       let ocrText = "";
       for (const f of pngs) {
-        const inP = path.join(tmp, f), outP = path.join(tmp, "prep-" + f);
+        const inP = path.join(dir, f), outP = path.join(dir, "prep-" + f);
         await run("convert", [inP, "-deskew", "40%", "-strip", "-colorspace", "Gray",
                               "-contrast-stretch", "1%x1%", "-brightness-contrast", "10x15",
                               "-sharpen", "0x1", outP]);
@@ -546,11 +577,11 @@ app.get("/", (_req, res) => {
   :root { --border:#E5E7EB; --bg:#F8FAFC; --card:#FFFFFF; --muted:#6B7280; --pri:#2563EB; --danger:#b91c1c; --ok:#065f46; }
   *{box-sizing:border-box;font-family:system-ui,Segoe UI,Inter,Roboto,Arial}
   body{margin:0;background:var(--bg);color:#0f172a}
-  .container{max-width:900px;margin:28px auto;padding:0 16px}
+  .container{max-width:980px;margin:28px auto;padding:0 16px}
   h1{font-size:28px;text-align:center;margin:0 0 18px}
   .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  label{display:block;font-size:12px;color:#374151;margin:8px 0 4px}
+  label{display:flex;align-items:center;gap:6px;font-size:12px;color:#374151;margin:8px 0 4px}
   input,textarea{width:100%;padding:10px;border-radius:8px;border:1px solid var(--border);background:#fff}
   textarea{min-height:70px}
   .section-title{font-weight:600;border-bottom:1px solid var(--border);padding-bottom:6px;margin:6px 0 12px}
@@ -570,81 +601,88 @@ app.get("/", (_req, res) => {
   .status{margin-top:8px;font-size:13px}
   .status.ok{color:var(--ok)}
   .status.err{color:var(--danger)}
+  .badge{display:inline-block;font-size:11px;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;border-radius:999px;padding:2px 8px}
+  .cm{border:1px solid #cbd5e1;border-radius:6px;font-size:11px;padding:2px 6px;background:#f8fafc;cursor:pointer}
+  .cm:hover{background:#eef2ff}
+  .count{font-size:11px;color:#6b7280}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>Carrier Notification Letter</h1>
+  <h1>Carrier Notification Letter <span id="draftBadge" class="badge" style="display:none"></span></h1>
 
   <div class="card">
     <div class="grid2">
       <div>
         <div class="section-title">KRONOS TITAN GmbH</div>
         <div class="muted">Peschstrasse 5, 51373 Leverkusen</div>
-        <div class="muted" style="margin-top:8px">Drag & drop a carrier notification PDF to autofill:</div>
+        <div class="muted" style="margin-top:8px">Drag & drop a carrier notification PDF to create Draft v1:</div>
         <div id="drop" class="drop" style="margin-top:8px">Drop PDF here or click<input id="file" type="file" accept="application/pdf" hidden/></div>
         <div id="status" class="muted status"></div>
       </div>
       <div>
         <div class="section-title">CARRIER NOTIFICATION TO:</div>
+        <label>To <button class="cm" data-field="carrier_to" title="Add comment">💬</button> <span class="count" id="cnt_carrier_to"></span></label>
         <textarea id="carrier_to" placeholder="Expeditors International GmbH&#10;Mönchhofallee 10&#10;65479 RAUNHEIM&#10;GERMANY"></textarea>
       </div>
     </div>
 
     <div class="row">
-      <div><label>Your Partner</label><input id="your_partner"/></div>
-      <div><label>Telephone</label><input id="shipper_phone"/></div>
+      <div><label>Your Partner <button class="cm" data-field="your_partner">💬</button> <span class="count" id="cnt_your_partner"></span></label><input id="your_partner"/></div>
+      <div><label>Telephone <button class="cm" data-field="shipper_phone">💬</button> <span class="count" id="cnt_shipper_phone"></span></label><input id="shipper_phone"/></div>
     </div>
     <div class="row">
-      <div><label>Email</label><input id="shipper_email"/></div>
+      <div><label>Email <button class="cm" data-field="shipper_email">💬</button> <span class="count" id="cnt_shipper_email"></span></label><input id="shipper_email"/></div>
       <div></div>
     </div>
 
     <div class="row">
-      <div><label>Shipment No.</label><input id="shipment_no"/></div>
-      <div><label>Order No.</label><input id="order_no"/></div>
+      <div><label>Shipment No. <button class="cm" data-field="shipment_no">💬</button> <span class="count" id="cnt_shipment_no"></span></label><input id="shipment_no"/></div>
+      <div><label>Order No. <button class="cm" data-field="order_no">💬</button> <span class="count" id="cnt_order_no"></span></label><input id="order_no"/></div>
     </div>
     <div class="row">
-      <div><label>Delivery No.</label><input id="delivery_no"/></div>
+      <div><label>Delivery No. <button class="cm" data-field="delivery_no">💬</button> <span class="count" id="cnt_delivery_no"></span></label><input id="delivery_no"/></div>
       <div></div>
     </div>
     <div class="row">
-      <div><label>Loading Date</label><input id="loading_date" placeholder="dd.mm.yyyy"/></div>
-      <div><label>Sched. Delivery Date</label><input id="scheduled_delivery_date" placeholder="dd.mm.yyyy"/></div>
+      <div><label>Loading Date <button class="cm" data-field="loading_date">💬</button> <span class="count" id="cnt_loading_date"></span></label><input id="loading_date" placeholder="dd.mm.yyyy"/></div>
+      <div><label>Sched. Delivery Date <button class="cm" data-field="scheduled_delivery_date">💬</button> <span class="count" id="cnt_scheduled_delivery_date"></span></label><input id="scheduled_delivery_date" placeholder="dd.mm.yyyy"/></div>
     </div>
     <div class="row">
-      <div><label>PO No.</label><input id="po_no"/></div>
-      <div><label>Order Label</label><input id="order_label"/></div>
+      <div><label>PO No. <button class="cm" data-field="po_no">💬</button> <span class="count" id="cnt_po_no"></span></label><input id="po_no"/></div>
+      <div><label>Order Label <button class="cm" data-field="order_label">💬</button> <span class="count" id="cnt_order_label"></span></label><input id="order_label"/></div>
     </div>
 
     <div class="section-title" style="margin-top:8px">Shipping Point</div>
     <div class="row4">
-      <div><label>Street</label><input id="shipping_street" placeholder="Titanstrasse, Gebäude B3"/></div>
-      <div><label>Postal</label><input id="shipping_postal" placeholder="26954"/></div>
-      <div><label>City</label><input id="shipping_city" placeholder="Nordenham"/></div>
-      <div><label>Country</label><input id="shipping_country" placeholder="Germany"/></div>
+      <div><label>Street <button class="cm" data-field="shipping_street">💬</button> <span class="count" id="cnt_shipping_street"></span></label><input id="shipping_street" placeholder="Titanstrasse, Gebäude B3"/></div>
+      <div><label>Postal <button class="cm" data-field="shipping_postal">💬</button> <span class="count" id="cnt_shipping_postal"></span></label><input id="shipping_postal" placeholder="26954"/></div>
+      <div><label>City <button class="cm" data-field="shipping_city">💬</button> <span class="count" id="cnt_shipping_city"></span></label><input id="shipping_city" placeholder="Nordenham"/></div>
+      <div><label>Country <button class="cm" data-field="shipping_country">💬</button> <span class="count" id="cnt_shipping_country"></span></label><input id="shipping_country" placeholder="Germany"/></div>
     </div>
 
     <div class="row" style="margin-top:8px">
-      <div><label>Way of Forwarding</label><input id="way_of_forwarding"/></div>
-      <div><label>Delivery Terms</label><input id="delivery_terms"/></div>
+      <div><label>Way of Forwarding <button class="cm" data-field="way_of_forwarding">💬</button> <span class="count" id="cnt_way_of_forwarding"></span></label><input id="way_of_forwarding"/></div>
+      <div><label>Delivery Terms <button class="cm" data-field="delivery_terms">💬</button> <span class="count" id="cnt_delivery_terms"></span></label><input id="delivery_terms"/></div>
     </div>
   </div>
 
   <div class="card">
     <div class="section-title">Consignee</div>
+    <label>Address <button class="cm" data-field="consignee_address">💬</button> <span class="count" id="cnt_consignee_address"></span></label>
     <textarea id="consignee_address" placeholder="Enter Consignee address"></textarea>
     <div class="row3">
-      <div><label>Customer No.</label><input id="customer_no"/></div>
-      <div><label>VAT No.</label><input id="vat_no" placeholder="EL-094158104"/></div>
-      <div><label>Customer PO No.</label><input id="customer_po"/></div>
+      <div><label>Customer No. <button class="cm" data-field="customer_no">💬</button> <span class="count" id="cnt_customer_no"></span></label><input id="customer_no"/></div>
+      <div><label>VAT No. <button class="cm" data-field="vat_no">💬</button> <span class="count" id="cnt_vat_no"></span></label><input id="vat_no" placeholder="EL-094158104"/></div>
+      <div><label>Customer PO No. <button class="cm" data-field="customer_po">💬</button> <span class="count" id="cnt_customer_po"></span></label><input id="customer_po"/></div>
     </div>
     <div class="row">
-      <div><label>Customer Contact</label><input id="customer_contact"/></div>
-      <div><label>Customer Phone Number</label><input id="customer_phone"/></div>
+      <div><label>Customer Contact <button class="cm" data-field="customer_contact">💬</button> <span class="count" id="cnt_customer_contact"></span></label><input id="customer_contact"/></div>
+      <div><label>Customer Phone Number <button class="cm" data-field="customer_phone">💬</button> <span class="count" id="cnt_customer_phone"></span></label><input id="customer_phone"/></div>
     </div>
     <div class="row">
-      <div><label>Customer Email</label><input id="customer_email"/></div>
+      <div><label>Customer Email <button class="cm" data-field="customer_email">💬</button> <span class="count" id="cnt_customer_email"></span></label><input id="customer_email"/></div>
       <div></div>
     </div>
   </div>
@@ -653,19 +691,19 @@ app.get("/", (_req, res) => {
     <div class="section-title">Notify Parties</div>
     <div class="row">
       <div>
-        <label>Notify 1 (Address)</label>
+        <label>Notify 1 (Address) <button class="cm" data-field="notify1_address">💬</button> <span class="count" id="cnt_notify1_address"></span></label>
         <textarea id="notify1_address" placeholder="Enter Notify Party 1 address"></textarea>
         <div class="row">
-          <div><label>Notify 1 Email</label><input id="notify1_email" placeholder="name@domain.com"/></div>
-          <div><label>Notify 1 Phone</label><input id="notify1_phone" placeholder="+30 ..."/></div>
+          <div><label>Notify 1 Email <button class="cm" data-field="notify1_email">💬</button> <span class="count" id="cnt_notify1_email"></span></label><input id="notify1_email" placeholder="name@domain.com"/></div>
+          <div><label>Notify 1 Phone <button class="cm" data-field="notify1_phone">💬</button> <span class="count" id="cnt_notify1_phone"></span></label><input id="notify1_phone" placeholder="+30 ..."/></div>
         </div>
       </div>
       <div>
-        <label>Notify 2 (Address)</label>
+        <label>Notify 2 (Address) <button class="cm" data-field="notify2_address">💬</button> <span class="count" id="cnt_notify2_address"></span></label>
         <textarea id="notify2_address" placeholder="Enter Notify Party 2 address"></textarea>
         <div class="row">
-          <div><label>Notify 2 Email</label><input id="notify2_email" placeholder=""/></div>
-          <div><label>Notify 2 Phone</label><input id="notify2_phone" placeholder=""/></div>
+          <div><label>Notify 2 Email <button class="cm" data-field="notify2_email">💬</button> <span class="count" id="cnt_notify2_email"></span></label><input id="notify2_email" placeholder=""/></div>
+          <div><label>Notify 2 Phone <button class="cm" data-field="notify2_phone">💬</button> <span class="count" id="cnt_notify2_phone"></span></label><input id="notify2_phone" placeholder=""/></div>
         </div>
       </div>
     </div>
@@ -679,8 +717,9 @@ app.get("/", (_req, res) => {
 
   <div class="card">
     <div class="section-title">B/L Remarks & Instructions</div>
+    <label>Remarks <button class="cm" data-field="bl_remarks">💬</button> <span class="count" id="cnt_bl_remarks"></span></label>
     <textarea id="bl_remarks" placeholder="Marks, Labelling, special instructions will appear here when present in the PDF."></textarea>
-    <label style="margin-top:8px">HS Code</label>
+    <label style="margin-top:8px">HS Code <button class="cm" data-field="hs_code">💬</button> <span class="count" id="cnt_hs_code"></span></label>
     <input id="hs_code"/>
   </div>
 
@@ -688,27 +727,28 @@ app.get("/", (_req, res) => {
     <div class="footer-row">
       <div>
         <div class="muted">Sincerely,</div>
-        <label>Your Name</label>
+        <label>Your Name <button class="cm" data-field="signature_name">💬</button> <span class="count" id="cnt_signature_name"></span></label>
         <input id="signature_name" placeholder="Authorized Signature"/>
       </div>
       <div>
-        <label>Date</label>
+        <label>Date <button class="cm" data-field="signature_date">💬</button> <span class="count" id="cnt_signature_date"></span></label>
         <input id="signature_date"/>
       </div>
     </div>
   </div>
 
   <div class="card">
-    <button class="btn" type="button" id="submitBtn">Submit Notification</button>
+    <div class="toolbar">
+      <button class="btn" type="button" id="saveDraftBtn" disabled>Save Draft</button>
+      <button class="btn" type="button" id="freezeBtn" disabled>Freeze & Submit</button>
+      <a class="btn" href="/api/shipments.csv">Download CSV</a>
+      <a class="btn" href="/api/health" target="_blank" rel="noopener">Health</a>
+    </div>
     <div id="saveStatus" class="status"></div>
   </div>
 
   <div class="card list">
     <div class="section-title">Past Notifications</div>
-    <div style="display:flex;gap:8px;margin-bottom:8px">
-      <a class="btn" href="/api/shipments.csv">Download CSV</a>
-      <a class="btn" href="/api/health" target="_blank" rel="noopener">Health</a>
-    </div>
     <div id="recent"></div>
   </div>
 </div>
@@ -724,6 +764,9 @@ var $ = function(sel){ return document.querySelector(sel); };
 var statusEl = $("#status");
 var prodWrap = $("#products");
 var saveStatus = $("#saveStatus");
+var draftBadge = $("#draftBadge");
+var currentDraftId = null;
+var currentVersionNo = null;
 
 function makeProductCard(idx, data){
   data = data || {};
@@ -775,6 +818,7 @@ async function handleFiles(files){
     var ctrl = new AbortController();
     var to = setTimeout(function(){ ctrl.abort(); }, 180000);
 
+    // nocache=1 → always create/use a draft from this upload
     var r = await fetch("/api/upload?nocache=1", { method: "POST", body: fd, signal: ctrl.signal });
     clearTimeout(to);
 
@@ -789,9 +833,20 @@ async function handleFiles(files){
       return;
     }
 
+    // Expect draft info
+    currentDraftId = js.draft_id || null;
+    currentVersionNo = js.version_no || 1;
+    if (currentDraftId) {
+      draftBadge.style.display = "inline-block";
+      draftBadge.textContent = "Draft v" + currentVersionNo + " (" + currentDraftId.slice(0,6) + "…)";
+      document.getElementById("saveDraftBtn").disabled = false;
+      document.getElementById("freezeBtn").disabled = false;
+      await refreshCommentCounts();
+    }
+
     var conf = (typeof js.confidence === "number") ? (" (confidence " + Math.round(js.confidence) + "%)") : "";
     var warn = (js.warnings && js.warnings.length) ? " — Check: " + js.warnings.join("; ") : "";
-    statusEl.textContent = "Parsed" + conf + ". Review the form." + warn;
+    statusEl.textContent = "Draft created" + conf + ". Review the form." + warn;
     statusEl.className = "status ok";
 
     fillForm(js);
@@ -849,96 +904,145 @@ function fillForm(d){
   prodWrap.innerHTML = "";
   var items = (d.items && d.items.length) ? d.items : [{},{}];
   for (var i=0;i<items.length;i++) addProduct(items[i]);
+
   loadRecent();
 }
 
+// Add product
 document.getElementById("addProduct").addEventListener("click", function(){ addProduct({}); });
 
-const submitBtn = document.getElementById("submitBtn");
-submitBtn.addEventListener("click", async function(){
-  saveStatus.textContent = "Saving…";
-  saveStatus.className = "status";
-  submitBtn.disabled = true;
-
+// Save Draft
+document.getElementById("saveDraftBtn").addEventListener("click", async function(){
+  if (!currentDraftId) { saveStatus.textContent = "No draft to save"; saveStatus.className = "status err"; return; }
+  const body = collectForm();
   try {
-    var body = {
-      carrier_to: $("#carrier_to").value,
-      your_partner: $("#your_partner").value,
-      shipper_phone: $("#shipper_phone").value,
-      shipper_email: $("#shipper_email").value,
-
-      shipment_no: $("#shipment_no").value,
-      order_no: $("#order_no").value,
-      delivery_no: $("#delivery_no").value,
-      loading_date: $("#loading_date").value,
-      scheduled_delivery_date: $("#scheduled_delivery_date").value,
-      po_no: $("#po_no").value,
-      order_label: $("#order_label").value,
-
-      shipping_street: $("#shipping_street").value,
-      shipping_postal: $("#shipping_postal").value,
-      shipping_city: $("#shipping_city").value,
-      shipping_country: $("#shipping_country").value,
-
-      way_of_forwarding: $("#way_of_forwarding").value,
-      delivery_terms: $("#delivery_terms").value,
-
-      consignee_address: $("#consignee_address").value,
-      customer_no: $("#customer_no").value,
-      vat_no: $("#vat_no").value,
-      customer_po: $("#customer_po").value,
-      customer_contact: $("#customer_contact").value,
-      customer_phone: $("#customer_phone").value,
-      customer_email: $("#customer_email").value,
-
-      notify1_address: $("#notify1_address").value,
-      notify1_email: $("#notify1_email").value,
-      notify1_phone: $("#notify1_phone").value,
-      notify2_address: $("#notify2_address").value,
-      notify2_email: $("#notify2_email").value,
-      notify2_phone: $("#notify2_phone").value,
-
-      bl_remarks: $("#bl_remarks").value,
-      hs_code: $("#hs_code").value,
-      signature_name: $("#signature_name").value,
-      signature_date: $("#signature_date").value,
-
-      items: [].map.call(prodWrap.querySelectorAll(".product"), function(div){
-        return {
-          product_name: div.querySelector('input[name="product_name"]').value,
-          net_kg: parseFloat(div.querySelector('input[name="net_kg"]').value || 0) || null,
-          gross_kg: parseFloat(div.querySelector('input[name="gross_kg"]').value || 0) || null,
-          pkgs: parseInt(div.querySelector('input[name="pkgs"]').value || 0) || null,
-          packaging: div.querySelector('input[name="packaging"]').value || null,
-          pallets: parseInt(div.querySelector('input[name="pallets"]').value || 0) || null
-        };
-      })
-    };
-
-    var r = await fetch("/api/save", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
-    var raw = await r.text();
-    var js;
-    try { js = JSON.parse(raw); } catch(e){ js = { error: "Non-JSON response", raw: raw }; }
-
-    if (!r.ok) {
-      saveStatus.textContent = (js.error || ("Save failed (" + r.status + ")")) + (js.raw ? " – " + js.raw : "");
-      saveStatus.className = "status err";
-      console.error("Save error:", js);
-      submitBtn.disabled = false;
-      return;
-    }
-
-    saveStatus.textContent = "Saved. ID: " + js.id;
+    const r = await fetch("/api/draft/" + currentDraftId + "/save", {
+      method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body)
+    });
+    const js = await r.json();
+    if (!r.ok) throw new Error(js.error || ("Save failed (" + r.status + ")"));
+    saveStatus.textContent = "Draft saved.";
     saveStatus.className = "status ok";
-    loadRecent();
-  } catch (err) {
-    saveStatus.textContent = "Save error: " + err.message;
+  } catch(e) {
+    saveStatus.textContent = "Save error: " + e.message;
     saveStatus.className = "status err";
-    console.error(err);
-  } finally {
-    submitBtn.disabled = false;
   }
 });
+
+// Freeze & Submit
+document.getElementById("freezeBtn").addEventListener("click", async function(){
+  if (!currentDraftId) { saveStatus.textContent = "No draft to freeze"; saveStatus.className = "status err"; return; }
+  saveStatus.textContent = "Freezing draft…";
+  saveStatus.className = "status";
+  try {
+    // ensure latest edits are captured
+    const body = collectForm();
+    await fetch("/api/draft/" + currentDraftId + "/save", {
+      method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body)
+    });
+
+    const r = await fetch("/api/draft/" + currentDraftId + "/freeze", { method:"POST" });
+    const js = await r.json();
+    if (!r.ok) throw new Error(js.error || ("Freeze failed (" + r.status + ")"));
+    saveStatus.textContent = "Frozen. Shipment saved (ID: " + js.shipment_id + ").";
+    saveStatus.className = "status ok";
+    loadRecent();
+  } catch(e) {
+    saveStatus.textContent = "Freeze error: " + e.message;
+    saveStatus.className = "status err";
+  }
+});
+
+function collectForm(){
+  return {
+    carrier_to: $("#carrier_to").value,
+    your_partner: $("#your_partner").value,
+    shipper_phone: $("#shipper_phone").value,
+    shipper_email: $("#shipper_email").value,
+
+    shipment_no: $("#shipment_no").value,
+    order_no: $("#order_no").value,
+    delivery_no: $("#delivery_no").value,
+    loading_date: $("#loading_date").value,
+    scheduled_delivery_date: $("#scheduled_delivery_date").value,
+    po_no: $("#po_no").value,
+    order_label: $("#order_label").value,
+
+    shipping_street: $("#shipping_street").value,
+    shipping_postal: $("#shipping_postal").value,
+    shipping_city: $("#shipping_city").value,
+    shipping_country: $("#shipping_country").value,
+
+    way_of_forwarding: $("#way_of_forwarding").value,
+    delivery_terms: $("#delivery_terms").value,
+
+    consignee_address: $("#consignee_address").value,
+    customer_no: $("#customer_no").value,
+    vat_no: $("#vat_no").value,
+    customer_po: $("#customer_po").value,
+    customer_contact: $("#customer_contact").value,
+    customer_phone: $("#customer_phone").value,
+    customer_email: $("#customer_email").value,
+
+    notify1_address: $("#notify1_address").value,
+    notify1_email: $("#notify1_email").value,
+    notify1_phone: $("#notify1_phone").value,
+    notify2_address: $("#notify2_address").value,
+    notify2_email: $("#notify2_email").value,
+    notify2_phone: $("#notify2_phone").value,
+
+    bl_remarks: $("#bl_remarks").value,
+    hs_code: $("#hs_code").value,
+    signature_name: $("#signature_name").value,
+    signature_date: $("#signature_date").value,
+
+    items: [].map.call(prodWrap.querySelectorAll(".product"), function(div){
+      return {
+        product_name: div.querySelector('input[name="product_name"]').value,
+        net_kg: parseFloat(div.querySelector('input[name="net_kg"]').value || 0) || null,
+        gross_kg: parseFloat(div.querySelector('input[name="gross_kg"]').value || 0) || null,
+        pkgs: parseInt(div.querySelector('input[name="pkgs"]').value || 0) || null,
+        packaging: div.querySelector('input[name="packaging"]').value || null,
+        pallets: parseInt(div.querySelector('input[name="pallets"]').value || 0) || null
+      };
+    })
+  };
+}
+
+// Comments: add handlers for all buttons .cm
+document.addEventListener("click", async function(e){
+  const btn = e.target.closest(".cm");
+  if (!btn) return;
+  if (!currentDraftId) { alert("Drop a PDF first to create a draft."); return; }
+  const field = btn.getAttribute("data-field");
+  const msg = prompt("Add a comment for “" + field + "”:");
+  if (!msg) return;
+  try {
+    const r = await fetch("/api/draft/" + currentDraftId + "/comment", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ field_name: field, message: msg, author: "" })
+    });
+    if (!r.ok) throw new Error((await r.json()).error || "Comment failed");
+    await refreshCommentCounts();
+  } catch(err) {
+    alert("Failed to add comment: " + err.message);
+  }
+});
+
+async function refreshCommentCounts(){
+  if (!currentDraftId) return;
+  const r = await fetch("/api/draft/" + currentDraftId);
+  if (!r.ok) return;
+  const js = await r.json();
+  const counts = {};
+  (js.comments || []).forEach(c => { counts[c.field_name] = (counts[c.field_name] || 0) + 1; });
+  document.querySelectorAll(".count").forEach(el => el.textContent = "");
+  Object.keys(counts).forEach(k => {
+    var el = document.getElementById("cnt_" + k);
+    if (el) el.textContent = counts[k] + " comment" + (counts[k] > 1 ? "s" : "");
+  });
+}
 
 async function loadRecent(){
   try {
@@ -976,40 +1080,55 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString(), db: DB_PATH });
 });
 
+/**
+ * Upload: extract text → parse → create/find Draft v1 (by PDF hash)
+ * Returns fields + { draft_id, version_no, status }
+ */
 app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const noCache = String(req.query.nocache || "") === "1";
     const hash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
 
-    if (!noCache) {
-      const cached = db.prepare("SELECT parsed FROM cache WHERE hash = ?").get(hash);
-      if (cached?.parsed) return res.json(JSON.parse(cached.parsed));
-    }
-
+    // Extract best text
     const text = await extractTextFromBuffer(req.file.buffer);
     if (!text || !text.trim()) {
-      return res.status(422).json({ error: "Unable to extract text (try /api/debug-text to inspect raw text)" });
+      return res.status(422).json({ error: "Unable to extract text" });
     }
 
+    // Parse + score
     const fields = parseFieldsFromText(text);
     const { score, warnings } = validateAndScore(fields);
     fields.confidence = score;
     fields.warnings = warnings;
 
-    if (!noCache) {
-      db.prepare("INSERT OR REPLACE INTO cache (hash, text, parsed, created_at) VALUES (?, ?, ?, ?)")
-        .run(hash, text, JSON.stringify(fields), new Date().toISOString());
+    // Create or reuse Draft v1 for this hash
+    let draft = db.prepare("SELECT * FROM drafts WHERE base_hash = ? AND version_no = 1").get(hash);
+    const now = new Date().toISOString();
+    if (!draft) {
+      const id = nanoid();
+      db.prepare(`INSERT INTO drafts (id, base_hash, version_no, status, data_json, created_at, updated_at)
+                  VALUES (?, ?, 1, 'draft', ?, ?, ?)`)
+        .run(id, hash, JSON.stringify(fields), now, now);
+      draft = { id, base_hash: hash, version_no: 1, status: "draft" };
+    } else {
+      // update server copy so reviewer sees latest parse
+      db.prepare(`UPDATE drafts SET data_json = ?, updated_at = ? WHERE id = ?`)
+        .run(JSON.stringify(fields), now, draft.id);
     }
 
-    res.json(fields);
+    // Also cache raw parse for debugging
+    db.prepare("INSERT OR REPLACE INTO cache (hash, text, parsed, created_at) VALUES (?, ?, ?, ?)")
+      .run(hash, text, JSON.stringify(fields), now);
+
+    res.json({ ...fields, draft_id: draft.id, version_no: draft.version_no, status: "draft" });
   } catch (err) {
     console.error("Upload failed:", err);
     res.status(500).json({ error: "Server error: " + (err.message || "unknown") });
   }
 });
 
+// Debug: see raw extracted text
 app.post("/api/debug-text", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file" });
@@ -1020,11 +1139,55 @@ app.post("/api/debug-text", upload.single("file"), async (req, res) => {
   }
 });
 
-app.post("/api/save", (req, res) => {
-  const s = req.body || {};
-  const id = nanoid();
+// Draft API
+app.get("/api/draft/:id", (req, res) => {
+  const id = req.params.id;
+  const d = db.prepare("SELECT * FROM drafts WHERE id = ?").get(id);
+  if (!d) return res.status(404).json({ error: "Draft not found" });
+  const comments = db.prepare("SELECT id, field_name, message, author, created_at FROM comments WHERE draft_id = ? ORDER BY datetime(created_at)").all(id);
+  res.json({
+    id: d.id,
+    version_no: d.version_no,
+    status: d.status,
+    fields: JSON.parse(d.data_json || "{}"),
+    comments
+  });
+});
+
+app.post("/api/draft/:id/save", (req, res) => {
+  const id = req.params.id;
+  const d = db.prepare("SELECT * FROM drafts WHERE id = ?").get(id);
+  if (!d) return res.status(404).json({ error: "Draft not found" });
+  if (d.status !== "draft") return res.status(409).json({ error: "Draft is frozen" });
+  const data = req.body || {};
+  db.prepare("UPDATE drafts SET data_json = ?, updated_at = ? WHERE id = ?")
+    .run(JSON.stringify(data), new Date().toISOString(), id);
+  res.json({ ok: true });
+});
+
+app.post("/api/draft/:id/comment", (req, res) => {
+  const id = req.params.id;
+  const d = db.prepare("SELECT * FROM drafts WHERE id = ?").get(id);
+  if (!d) return res.status(404).json({ error: "Draft not found" });
+  const { field_name, message, author } = req.body || {};
+  if (!field_name || !message) return res.status(400).json({ error: "field_name and message are required" });
+  db.prepare("INSERT INTO comments (id, draft_id, field_name, message, author, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(nanoid(), id, String(field_name), String(message), (author || "").toString(), new Date().toISOString());
+  res.json({ ok: true });
+});
+
+/* Freeze draft → create final shipment + items; mark draft frozen */
+app.post("/api/draft/:id/freeze", (req, res) => {
+  const id = req.params.id;
+  const d = db.prepare("SELECT * FROM drafts WHERE id = ?").get(id);
+  if (!d) return res.status(404).json({ error: "Draft not found" });
+  if (d.status !== "draft") return res.status(409).json({ error: "Already frozen" });
+
+  const s = JSON.parse(d.data_json || "{}");
+  const shipment_id = nanoid();
   const created_at = dayjs().toISOString();
-  try {
+
+  const tx = db.transaction(() => {
     db.prepare(`
       INSERT INTO shipments (
         id, created_at, your_partner, shipper_phone, shipper_email,
@@ -1038,7 +1201,7 @@ app.post("/api/save", (req, res) => {
         bl_remarks, hs_code, signature_name, signature_date
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(
-      id, created_at, s.your_partner, s.shipper_phone, s.shipper_email,
+      shipment_id, created_at, s.your_partner, s.shipper_phone, s.shipper_email,
       s.shipment_no, s.order_no, s.delivery_no, s.loading_date, s.scheduled_delivery_date,
       s.po_no, s.order_label,
       s.shipping_street, s.shipping_postal, s.shipping_city, s.shipping_country,
@@ -1054,7 +1217,7 @@ app.post("/api/save", (req, res) => {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
     (Array.isArray(s.items) ? s.items : []).forEach(it => {
-      insItem.run(nanoid(), id,
+      insItem.run(nanoid(), shipment_id,
         it.product_name || null,
         it.net_kg ?? null,
         it.gross_kg ?? null,
@@ -1064,13 +1227,15 @@ app.post("/api/save", (req, res) => {
       );
     });
 
-    res.json({ id });
-  } catch (e) {
-    console.error("Save failed:", e);
-    res.status(500).json({ error: "Save failed: " + (e.message || "unknown") });
-  }
+    db.prepare("UPDATE drafts SET status = 'frozen', updated_at = ? WHERE id = ?")
+      .run(new Date().toISOString(), id);
+  });
+  tx();
+
+  res.json({ ok: true, shipment_id, draft_id: id });
 });
 
+// Existing shipment endpoints
 app.get("/api/shipments", (_req, res) => {
   try {
     const rows = db.prepare(`
