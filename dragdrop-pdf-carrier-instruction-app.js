@@ -7,9 +7,16 @@ const pdfParse = require("pdf-parse");
 const dayjs = require("dayjs");
 const Database = require("better-sqlite3");
 const { nanoid } = require("nanoid");
+const path = require("path");
+const fs = require("fs");
 
 // Use disk path if provided (Render), fallback to local file
 const DB_PATH = process.env.SQLITE_DB_PATH || "shipments.db";
+
+// Ensure directory exists
+const dbDir = path.dirname(DB_PATH);
+if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+
 const db = new Database(DB_PATH);
 
 // Create tables if not exist
