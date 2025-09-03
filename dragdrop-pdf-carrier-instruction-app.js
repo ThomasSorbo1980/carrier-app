@@ -1,10 +1,9 @@
 /**
  * Carrier Notification Letter
  * PDF → Autofill form → Save to SQLite (Render disk-ready)
- * Extraction pipeline: pdf-parse + pdftotext -layout + Tesseract OCR
+ * Extraction: pdf-parse + pdftotext -layout + Tesseract OCR
  */
 
-// ====== REQUIRES ======
 const express = require("express");
 const multer = require("multer");
 const pdfParse = require("pdf-parse");
@@ -17,7 +16,7 @@ const os = require("os");
 const { execFile } = require("child_process");
 const crypto = require("crypto");
 
-// ====== DB INIT (MUST be before any db.prepare calls) ======
+// ---------- DB ----------
 const DB_PATH = process.env.SQLITE_DB_PATH || "shipments.db";
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
@@ -25,7 +24,6 @@ if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 const db = new Database(DB_PATH);
 try { db.pragma("journal_mode = WAL"); } catch (_){}
 
-// ====== TABLES ======
 db.prepare(`
   CREATE TABLE IF NOT EXISTS shipments (
     id TEXT PRIMARY KEY,
@@ -93,7 +91,7 @@ db.prepare(`
   )
 `).run();
 
-// ====== AUTO-MIGRATIONS ======
+// auto-migrate (idempotent)
 function ensureColumns(table, cols) {
   const existing = db.prepare(`PRAGMA table_info(${table})`).all();
   const namesLC = new Set(existing.map(r => String(r.name).toLowerCase()));
@@ -122,6 +120,8 @@ ensureColumns("items", { packaging: "TEXT", pallets: "INTEGER" });
 // ---------- App ----------
 const app = express();
 app.use(express.json({ limit: "8mb" }));
+app.use(express.urlencoded({ extended: true }));
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ---------- Helpers ----------
@@ -165,8 +165,6 @@ function findEmail(line) {
   const m = cleaned.match(/\b[A-Z0-9][A-Z0-9._%+-]*@[A-Z0-9.-]+\.[A-Z]{2,}\b/i);
   return m ? m[0].replace(/^[.\-_:;]+/, "") : "";
 }
-
-// Grab a value AFTER a label (even on next line)
 function grabNear(labelRe, valueRe, text, windowChars = 120) {
   const m = labelRe.exec(text);
   if (!m) return "";
@@ -175,8 +173,6 @@ function grabNear(labelRe, valueRe, text, windowChars = 120) {
   const mv    = valueRe.exec(seg);
   return mv ? clean(mv[1] ?? mv[0]) : "";
 }
-
-// Grab N lines after label until stop word
 function grabBlock(labelRe, stopRes, text, maxLines = 8) {
   const m = labelRe.exec(text);
   if (!m) return "";
@@ -191,7 +187,6 @@ function grabBlock(labelRe, stopRes, text, maxLines = 8) {
   }
   return out.join("\n");
 }
-
 function parseShippingPoint(block) {
   const res = { street: "", postal: "", city: "", country: "" };
   if (!block) return res;
@@ -211,7 +206,6 @@ function parseShippingPoint(block) {
   for (const k of Object.keys(res)) res[k] = clean(res[k]);
   return res;
 }
-
 function sanitizeCarrierToBlock(s) {
   if (!s) return "";
   const DROP = /(Your\s*Partner|Telephone|Phone|Email|Shipment\s*No|Order\s*No|Delivery\s*No|Loading\s*Date|Shipping\s*Point|Street|Postal|City|Country|Way\s*of\s*Forwarding|Delivery\s*Terms|Incoterms)/i;
@@ -225,7 +219,6 @@ function sanitizeCarrierToBlock(s) {
   }
   return out.join("\n");
 }
-
 function parseLabeledFields(block, labels) {
   const res = {};
   if (!block) return res;
@@ -247,22 +240,15 @@ function parseLabeledFields(block, labels) {
   }
   return res;
 }
-
-// Notify parser (robust)
 function parseNotify(fullText, which = 1) {
   let address = "", email = "", phone = "";
   const stop = [/Notify\s*2/i, /Notify\s*1/i, /Goods\s*Information/i, /B\/L/i, /HS\s*Code/i, /KRONOS/i, /Customer/i, /Order/i, /Shipping\s*Point/i];
-
-  // explicit label
   let block = grabBlock(which === 1 ? /Notify\s*1[.:\-]?\s*/i : /Notify\s*2[.:\-]?\s*/i, stop, fullText, 12);
-
-  // fallbacks
   if (!block) {
     block = which === 1
       ? match(/Notify[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:MARKS\s*TEXT|NOTIFY\s*2|ORDER\s*No|B\/L|HS\s*CODE|KRONOS|$))/i, fullText)
       : match(/NOTIFY\s*2[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:PLEASE\s+ISSUE|B\/L|HS\s*CODE|MARKS|KRONOS|$))/i, fullText);
   }
-
   if (block) {
     const lines = block.split("\n").map(l => clean(l)).filter(Boolean);
     const addr = [];
@@ -270,7 +256,7 @@ function parseNotify(fullText, which = 1) {
       const m = findEmail(line);
       if (m) { email = m; continue; }
       if (/Tel\.|Phone|^\+?\d[\d ()/.\-]*$/.test(line)) { phone = line.replace(/^.*?(Tel\.|Phone)\s*:?\s*/i,""); continue; }
-      if (/Vat\s*No\./i.test(line)) continue; // keep VAT out of address
+      if (/Vat\s*No\./i.test(line)) continue;
       addr.push(line);
     }
     address = addr.join("\n");
@@ -278,7 +264,7 @@ function parseNotify(fullText, which = 1) {
   return { address, email, phone };
 }
 
-// ---------- Extraction (parallel; OCR also) ----------
+// ---------- Extraction ----------
 async function extractTextFromBuffer(pdfBuffer) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
   const pdfPath = path.join(tmp, "input.pdf");
@@ -316,7 +302,6 @@ async function extractTextFromBuffer(pdfBuffer) {
                          .sort((a, b) => b.score - a.score)[0].t;
   return best;
 }
-
 function scoreText(txt) {
   if (!txt) return 0;
   const keys = ["Shipment", "Order", "Delivery", "Delivery Address", "Notify", "TOTAL", "Way of Forwarding", "MARKS"];
@@ -327,7 +312,7 @@ function scoreText(txt) {
   return keyHits * 10 + Math.min(20, numbers) + Math.min(10, dates) + lenScore;
 }
 
-// ---------- PARSER ----------
+// ---------- Parser ----------
 function parseFieldsFromText(textRaw) {
   const full = clean(textRaw).replace(/\r/g, "");
   const norm = full.replace(/[\t\f]+/g, " ");
@@ -433,12 +418,12 @@ function parseFieldsFromText(textRaw) {
     customer_phone = "";
   }
 
-  // VAT number (global)
+  // VAT number
   let vat_no = "";
   const vatM = /\bVAT\s*No\.?\s*[:\-]?\s*([A-Z]{1,3}[- ]?\d[\d\- ]{4,})/i.exec(full);
   if (vatM) vat_no = clean(vatM[1]).replace(/\s+/g, "");
 
-  // Notify 1 & 2
+  // Notify
   const n1 = parseNotify(full, 1);
   const n2 = parseNotify(full, 2);
   const notify1_address = n1.address || "";
@@ -448,7 +433,7 @@ function parseFieldsFromText(textRaw) {
   const notify2_email   = n2.email   || "";
   const notify2_phone   = n2.phone   || "";
 
-  // MARKS TEXT & LABELLING → B/L remarks
+  // MARKS & LABELLING → remarks
   const marksBlock = match(/MARKS?\s*TEXT[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:LABELLING|Notify|NOTIFY|B\/L|HS\s*CODE|Goods|KRONOS|$))/i, full);
   const labellingBlock = match(/LABELLING[.:\-]?\s*([\s\S]*?)(?=\n\s*(?:ORDER\s*No|Notify|NOTIFY|B\/L|HS\s*CODE|KRONOS|$))/i, full);
 
@@ -485,7 +470,6 @@ function parseFieldsFromText(textRaw) {
     return { product_name, net_kg, gross_kg, pkgs, packaging, pallets };
   });
 
-  // PO preference & tidy
   const po_no_explicit = match(/PO\s*No[.:\-]?\s*([A-Za-z0-9/ -]+)/i, full);
   const po_no = (order_label || po_no_explicit || customer_po || "").trim();
 
@@ -522,7 +506,7 @@ function parseFieldsFromText(textRaw) {
 
     consignee_address,
     customer_no: _customer_no,
-    vat_no,                     // NEW
+    vat_no,
     customer_po: _customer_po,
 
     customer_contact,
@@ -559,7 +543,7 @@ app.get("/", (_req, res) => {
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Carrier Notification Letter</title>
 <style>
-  :root { --border:#E5E7EB; --bg:#F8FAFC; --card:#FFFFFF; --muted:#6B7280; --pri:#2563EB; }
+  :root { --border:#E5E7EB; --bg:#F8FAFC; --card:#FFFFFF; --muted:#6B7280; --pri:#2563EB; --danger:#b91c1c; --ok:#065f46; }
   *{box-sizing:border-box;font-family:system-ui,Segoe UI,Inter,Roboto,Arial}
   body{margin:0;background:var(--bg);color:#0f172a}
   .container{max-width:900px;margin:28px auto;padding:0 16px}
@@ -575,6 +559,7 @@ app.get("/", (_req, res) => {
   .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
   .row4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px}
   .btn{display:inline-block;text-decoration:none;text-align:center;background:var(--pri);color:#fff;border:none;border-radius:8px;padding:10px 12px;cursor:pointer}
+  .btn[disabled]{opacity:.6;cursor:not-allowed}
   .btn-link{color:#2563EB;background:transparent;border:none;cursor:pointer;padding:0;margin:8px 0}
   .drop{border:2px dashed #cbd5e1;border-radius:10px;padding:12px;text-align:center;cursor:pointer}
   .product{background:#F9FAFB;border:1px solid var(--border);border-radius:8px;padding:12px;margin:8px 0}
@@ -582,6 +567,9 @@ app.get("/", (_req, res) => {
   .footer-row{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:center}
   .list table{width:100%;border-collapse:collapse}
   .list th,.list td{border-bottom:1px solid var(--border);padding:8px;text-align:left;font-size:14px}
+  .status{margin-top:8px;font-size:13px}
+  .status.ok{color:var(--ok)}
+  .status.err{color:var(--danger)}
 </style>
 </head>
 <body>
@@ -595,7 +583,7 @@ app.get("/", (_req, res) => {
         <div class="muted">Peschstrasse 5, 51373 Leverkusen</div>
         <div class="muted" style="margin-top:8px">Drag & drop a carrier notification PDF to autofill:</div>
         <div id="drop" class="drop" style="margin-top:8px">Drop PDF here or click<input id="file" type="file" accept="application/pdf" hidden/></div>
-        <div id="status" class="muted" style="margin-top:8px"></div>
+        <div id="status" class="muted status"></div>
       </div>
       <div>
         <div class="section-title">CARRIER NOTIFICATION TO:</div>
@@ -712,18 +700,30 @@ app.get("/", (_req, res) => {
 
   <div class="card">
     <button class="btn" type="button" id="submitBtn">Submit Notification</button>
+    <div id="saveStatus" class="status"></div>
   </div>
 
   <div class="card list">
     <div class="section-title">Past Notifications</div>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <a class="btn" href="/api/shipments.csv">Download CSV</a>
+      <a class="btn" href="/api/health" target="_blank" rel="noopener">Health</a>
+    </div>
     <div id="recent"></div>
   </div>
 </div>
 
 <script>
+window.addEventListener('error', function(e){
+  var s = document.getElementById('saveStatus');
+  if (s) { s.textContent = 'Script error: ' + e.message; s.className = 'status err'; }
+  console.error('Global error:', e.error || e.message);
+});
+
 var $ = function(sel){ return document.querySelector(sel); };
 var statusEl = $("#status");
 var prodWrap = $("#products");
+var saveStatus = $("#saveStatus");
 
 function makeProductCard(idx, data){
   data = data || {};
@@ -749,7 +749,11 @@ function makeProductCard(idx, data){
     +   '<div></div>'
     + '</div>';
   div.innerHTML = html;
-  div.querySelector('button').onclick = function(){ div.remove(); var hs = prodWrap.querySelectorAll('.product header strong'); for (var i=0;i<hs.length;i++){ hs[i].textContent = 'Product ' + (i+1); } };
+  div.querySelector('button').onclick = function(){
+    div.remove();
+    var hs = prodWrap.querySelectorAll('.product header strong');
+    for (var i=0;i<hs.length;i++){ hs[i].textContent = 'Product ' + (i+1); }
+  };
   return div;
 }
 function addProduct(data){ prodWrap.appendChild(makeProductCard(prodWrap.children.length, data)); }
@@ -763,6 +767,7 @@ file.addEventListener("change", function(e){ handleFiles(e.target.files); });
 async function handleFiles(files){
   var f = files[0]; if (!f) return;
   statusEl.textContent = "Uploading & extracting…";
+  statusEl.className = "status";
   try {
     var fd = new FormData();
     fd.append("file", f);
@@ -779,6 +784,7 @@ async function handleFiles(files){
 
     if (!r.ok) {
       statusEl.textContent = js.error || ("Upload failed (" + r.status + ")");
+      statusEl.className = "status err";
       console.error("Upload error response:", js.raw || js);
       return;
     }
@@ -786,10 +792,12 @@ async function handleFiles(files){
     var conf = (typeof js.confidence === "number") ? (" (confidence " + Math.round(js.confidence) + "%)") : "";
     var warn = (js.warnings && js.warnings.length) ? " — Check: " + js.warnings.join("; ") : "";
     statusEl.textContent = "Parsed" + conf + ". Review the form." + warn;
+    statusEl.className = "status ok";
 
     fillForm(js);
   } catch (err) {
     statusEl.textContent = "Network/timeout: " + err.message;
+    statusEl.className = "status err";
     console.error(err);
   }
 }
@@ -844,95 +852,130 @@ function fillForm(d){
   loadRecent();
 }
 
-document.getElementById("addProduct").onclick = function(){ addProduct({}); };
-document.getElementById("submitBtn").onclick = async function(){
-  var body = {
-    carrier_to: $("#carrier_to").value,
-    your_partner: $("#your_partner").value,
-    shipper_phone: $("#shipper_phone").value,
-    shipper_email: $("#shipper_email").value,
+document.getElementById("addProduct").addEventListener("click", function(){ addProduct({}); });
 
-    shipment_no: $("#shipment_no").value,
-    order_no: $("#order_no").value,
-    delivery_no: $("#delivery_no").value,
-    loading_date: $("#loading_date").value,
-    scheduled_delivery_date: $("#scheduled_delivery_date").value,
-    po_no: $("#po_no").value,
-    order_label: $("#order_label").value,
+const submitBtn = document.getElementById("submitBtn");
+submitBtn.addEventListener("click", async function(){
+  saveStatus.textContent = "Saving…";
+  saveStatus.className = "status";
+  submitBtn.disabled = true;
 
-    shipping_street: $("#shipping_street").value,
-    shipping_postal: $("#shipping_postal").value,
-    shipping_city: $("#shipping_city").value,
-    shipping_country: $("#shipping_country").value,
+  try {
+    var body = {
+      carrier_to: $("#carrier_to").value,
+      your_partner: $("#your_partner").value,
+      shipper_phone: $("#shipper_phone").value,
+      shipper_email: $("#shipper_email").value,
 
-    way_of_forwarding: $("#way_of_forwarding").value,
-    delivery_terms: $("#delivery_terms").value,
+      shipment_no: $("#shipment_no").value,
+      order_no: $("#order_no").value,
+      delivery_no: $("#delivery_no").value,
+      loading_date: $("#loading_date").value,
+      scheduled_delivery_date: $("#scheduled_delivery_date").value,
+      po_no: $("#po_no").value,
+      order_label: $("#order_label").value,
 
-    consignee_address: $("#consignee_address").value,
-    customer_no: $("#customer_no").value,
-    vat_no: $("#vat_no").value,
-    customer_po: $("#customer_po").value,
-    customer_contact: $("#customer_contact").value,
-    customer_phone: $("#customer_phone").value,
-    customer_email: $("#customer_email").value,
+      shipping_street: $("#shipping_street").value,
+      shipping_postal: $("#shipping_postal").value,
+      shipping_city: $("#shipping_city").value,
+      shipping_country: $("#shipping_country").value,
 
-    notify1_address: $("#notify1_address").value,
-    notify1_email: $("#notify1_email").value,
-    notify1_phone: $("#notify1_phone").value,
-    notify2_address: $("#notify2_address").value,
-    notify2_email: $("#notify2_email").value,
-    notify2_phone: $("#notify2_phone").value,
+      way_of_forwarding: $("#way_of_forwarding").value,
+      delivery_terms: $("#delivery_terms").value,
 
-    bl_remarks: $("#bl_remarks").value,
-    hs_code: $("#hs_code").value,
-    signature_name: $("#signature_name").value,
-    signature_date: $("#signature_date").value,
+      consignee_address: $("#consignee_address").value,
+      customer_no: $("#customer_no").value,
+      vat_no: $("#vat_no").value,
+      customer_po: $("#customer_po").value,
+      customer_contact: $("#customer_contact").value,
+      customer_phone: $("#customer_phone").value,
+      customer_email: $("#customer_email").value,
 
-    items: [].map.call(prodWrap.querySelectorAll(".product"), function(div){
-      return {
-        product_name: div.querySelector('input[name="product_name"]').value,
-        net_kg: parseFloat(div.querySelector('input[name="net_kg"]').value || 0) || null,
-        gross_kg: parseFloat(div.querySelector('input[name="gross_kg"]').value || 0) || null,
-        pkgs: parseInt(div.querySelector('input[name="pkgs"]').value || 0) || null,
-        packaging: div.querySelector('input[name="packaging"]').value || null,
-        pallets: parseInt(div.querySelector('input[name="pallets"]').value || 0) || null
-      };
-    })
-  };
+      notify1_address: $("#notify1_address").value,
+      notify1_email: $("#notify1_email").value,
+      notify1_phone: $("#notify1_phone").value,
+      notify2_address: $("#notify2_address").value,
+      notify2_email: $("#notify2_email").value,
+      notify2_phone: $("#notify2_phone").value,
 
-  var r = await fetch("/api/save", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
-  var js = await r.json();
-  statusEl.textContent = r.ok ? ("Saved. ID: " + js.id) : (js.error || "Save failed");
-  if (r.ok) loadRecent();
-};
+      bl_remarks: $("#bl_remarks").value,
+      hs_code: $("#hs_code").value,
+      signature_name: $("#signature_name").value,
+      signature_date: $("#signature_date").value,
+
+      items: [].map.call(prodWrap.querySelectorAll(".product"), function(div){
+        return {
+          product_name: div.querySelector('input[name="product_name"]').value,
+          net_kg: parseFloat(div.querySelector('input[name="net_kg"]').value || 0) || null,
+          gross_kg: parseFloat(div.querySelector('input[name="gross_kg"]').value || 0) || null,
+          pkgs: parseInt(div.querySelector('input[name="pkgs"]').value || 0) || null,
+          packaging: div.querySelector('input[name="packaging"]').value || null,
+          pallets: parseInt(div.querySelector('input[name="pallets"]').value || 0) || null
+        };
+      })
+    };
+
+    var r = await fetch("/api/save", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body) });
+    var raw = await r.text();
+    var js;
+    try { js = JSON.parse(raw); } catch(e){ js = { error: "Non-JSON response", raw: raw }; }
+
+    if (!r.ok) {
+      saveStatus.textContent = (js.error || ("Save failed (" + r.status + ")")) + (js.raw ? " – " + js.raw : "");
+      saveStatus.className = "status err";
+      console.error("Save error:", js);
+      submitBtn.disabled = false;
+      return;
+    }
+
+    saveStatus.textContent = "Saved. ID: " + js.id;
+    saveStatus.className = "status ok";
+    loadRecent();
+  } catch (err) {
+    saveStatus.textContent = "Save error: " + err.message;
+    saveStatus.className = "status err";
+    console.error(err);
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
 
 async function loadRecent(){
-  const r = await fetch("/api/shipments");
-  const rows = await r.json();
-  let h = '<div style="display:flex;gap:8px;margin-bottom:8px">'
-        + '<a class="btn" href="/api/shipments.csv">Download CSV</a>'
-        + '</div>';
-  h += '<table><thead><tr><th>Created</th><th>Shipment</th><th>Order</th><th>Consignee</th><th>Total Net (kg)</th><th></th></tr></thead><tbody>';
-  (rows||[]).forEach(s => {
-    const consignee = ((s.consignee_address||'').split('\\n')[0]||'');
-    h += '<tr>'
-      + '<td>' + s.created_at + '</td>'
-      + '<td>' + (s.shipment_no||'') + '</td>'
-      + '<td>' + (s.order_no||'') + '</td>'
-      + '<td>' + consignee + '</td>'
-      + '<td>' + (s.total_net_kg||'') + '</td>'
-      + '<td><a href="/api/shipment/' + s.id + '" target="_blank" rel="noopener">View</a></td>'
-      + '</tr>';
-  });
-  h += '</tbody></table>';
-  document.querySelector('#recent').innerHTML = h;
+  try {
+    const r = await fetch("/api/shipments");
+    const rows = await r.json();
+    let h = '<table><thead><tr><th>Created</th><th>Shipment</th><th>Order</th><th>Consignee</th><th>Total Net (kg)</th><th></th></tr></thead><tbody>';
+    (rows||[]).forEach(s => {
+      const consignee = ((s.consignee_address||'').split('\\n')[0]||'');
+      h += '<tr>'
+        + '<td>' + s.created_at + '</td>'
+        + '<td>' + (s.shipment_no||'') + '</td>'
+        + '<td>' + (s.order_no||'') + '</td>'
+        + '<td>' + consignee + '</td>'
+        + '<td>' + (s.total_net_kg||'') + '</td>'
+        + '<td><a href="/api/shipment/' + s.id + '" target="_blank" rel="noopener">View</a></td>'
+        + '</tr>';
+    });
+    h += '</tbody></table>';
+    document.querySelector('#recent').innerHTML = h;
+  } catch (e) {
+    document.querySelector('#recent').innerHTML = '<div class="status err">Failed to load history</div>';
+    console.error(e);
+  }
 }
+
+// initial defaults
 document.getElementById("signature_date").value = new Date().toISOString().slice(0,10);
+loadRecent();
 </script>
 </body></html>`);
 });
 
 // ---------- API ----------
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, time: new Date().toISOString(), db: DB_PATH });
+});
+
 app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
@@ -967,18 +1010,16 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// Inspect raw text of a PDF (debug)
 app.post("/api/debug-text", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file" });
     const txt = await extractTextFromBuffer(req.file.buffer);
     res.type("text/plain").send(txt || "(no text extracted)");
   } catch (e) {
-    res.status(500).json({ error: "debug failed" });
+    res.status(500).json({ error: "debug failed: " + (e.message || "unknown") });
   }
 });
 
-// Save a notification
 app.post("/api/save", (req, res) => {
   const s = req.body || {};
   const id = nanoid();
@@ -1025,12 +1066,11 @@ app.post("/api/save", (req, res) => {
 
     res.json({ id });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Save failed" });
+    console.error("Save failed:", e);
+    res.status(500).json({ error: "Save failed: " + (e.message || "unknown") });
   }
 });
 
-// List notifications
 app.get("/api/shipments", (_req, res) => {
   try {
     const rows = db.prepare(`
@@ -1042,11 +1082,10 @@ app.get("/api/shipments", (_req, res) => {
     res.json(rows);
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "DB failed" });
+    res.status(500).json({ error: "DB failed: " + (e.message || "unknown") });
   }
 });
 
-// Single shipment detail (JSON with items)
 app.get("/api/shipment/:id", (req, res) => {
   const id = req.params.id;
   const s = db.prepare("SELECT * FROM shipments WHERE id = ?").get(id);
@@ -1055,7 +1094,6 @@ app.get("/api/shipment/:id", (req, res) => {
   res.json({ ...s, items });
 });
 
-// CSV export (last 100)
 app.get("/api/shipments.csv", (_req, res) => {
   const rows = db.prepare(`
     SELECT created_at, id, shipment_no, order_no, customer_no, po_no, total_net_kg, total_gross_kg, total_pkgs
