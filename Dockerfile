@@ -1,30 +1,29 @@
-# --- Base image ---
-FROM node:20-slim
+# Use Node 18
+FROM node:18-slim
 
-# --- Install system dependencies ---
-# better-sqlite3 needs build tools, and we need pdf/ocr tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 g++ make \
+# Install system dependencies needed for pdf/image/ocr tools
+RUN apt-get update && apt-get install -y \
     poppler-utils \
     tesseract-ocr \
     imagemagick \
- && rm -rf /var/lib/apt/lists/*
+    build-essential \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
 
-# --- Set working directory ---
+# Set working directory
 WORKDIR /app
 
-# --- Install deps ---
-# Copy only package.json + lock first (better caching)
+# Copy package.json (and lockfile if present)
 COPY package.json package-lock.json* ./
 
-# Install production deps (no dev)
-RUN npm ci --only=production
+# Install dependencies
+RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
-# --- Copy the rest of the app ---
+# Copy rest of the project
 COPY . .
 
-# --- Expose port ---
+# Expose port
 EXPOSE 3000
 
-# --- Start command ---
-CMD ["node", "server.js"]
+# Start app
+CMD ["npm", "start"]
