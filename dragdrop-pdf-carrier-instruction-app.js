@@ -733,37 +733,33 @@ async function openaiExtract({ textBest, alternates, seedFields }) {
 
 // ---------- UI ----------
 app.get("/", (_req, res) => {
+// ---------- UI (drop-in replacement) ----------
+app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Carrier Notification Letter</title>
+<title>Shipping Instruction</title>
 <style>
   :root { --border:#E5E7EB; --bg:#F8FAFC; --card:#FFFFFF; --muted:#6B7280; --pri:#2563EB; --danger:#b91c1c; --ok:#065f46; }
   *{box-sizing:border-box;font-family:system-ui,Segoe UI,Inter,Roboto,Arial}
   body{margin:0;background:var(--bg);color:#0f172a}
   .container{max-width:980px;margin:28px auto;padding:0 16px}
   h1{font-size:28px;text-align:center;margin:0 0 18px}
+  h2{font-size:16px;margin:0 0 10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
   .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.04)}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+  .grid4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px}
   label{display:flex;align-items:center;gap:6px;font-size:12px;color:#374151;margin:8px 0 4px}
   input,textarea{width:100%;padding:10px;border-radius:8px;border:1px solid var(--border);background:#fff}
   textarea{min-height:70px}
-  .section-title{font-weight:600;border-bottom:1px solid var(--border);padding-bottom:6px;margin:6px 0 12px}
   .muted{color:var(--muted)}
-  .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
-  .row4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:16px}
   .btn{display:inline-block;text-decoration:none;text-align:center;background:var(--pri);color:#fff;border:none;border-radius:8px;padding:10px 12px;cursor:pointer}
   .btn[disabled]{opacity:.6;cursor:not-allowed}
   .btn-link{color:#2563EB;background:transparent;border:none;cursor:pointer;padding:0;margin:8px 0}
   .drop{border:2px dashed #cbd5e1;border-radius:10px;padding:12px;text-align:center;cursor:pointer}
-  .product{background:#F9FAFB;border:1px solid var(--border);border-radius:8px;padding:12px;margin:8px 0}
-  .product header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-  .footer-row{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:center}
-  .list table{width:100%;border-collapse:collapse}
-  .list th,.list td{border-bottom:1px solid var(--border);padding:8px;text-align:left;font-size:14px}
   .status{margin-top:8px;font-size:13px}
   .status.ok{color:var(--ok)}
   .status.err{color:var(--danger)}
@@ -772,125 +768,269 @@ app.get("/", (_req, res) => {
   .cm:hover{background:#eef2ff}
   .count{font-size:11px;color:#6b7280}
   .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .product{background:#F9FAFB;border:1px solid var(--border);border-radius:8px;padding:12px;margin:8px 0}
+  .product header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .list table{width:100%;border-collapse:collapse}
+  .list th,.list td{border-bottom:1px solid var(--border);padding:8px;text-align:left;font-size:14px}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>Carrier Notification Letter <span id="draftBadge" class="badge" style="display:none"></span></h1>
+  <h1>Shipping Instruction <span id="draftBadge" class="badge" style="display:none"></span></h1>
 
+  <!-- Import & Create draft -->
   <div class="card">
     <div class="grid2">
       <div>
-        <div class="section-title">KRONOS TITAN GmbH</div>
-        <div class="muted">Peschstrasse 5, 51373 Leverkusen</div>
-        <div class="muted" style="margin-top:8px">Drag & drop a carrier notification PDF to create Draft v1:</div>
+        <div class="muted">Drop your PDF to auto-fill a Draft v1:</div>
         <div id="drop" class="drop" style="margin-top:8px">Drop PDF here or click<input id="file" type="file" accept="application/pdf" hidden/></div>
         <div id="status" class="muted status"></div>
       </div>
       <div>
-        <div class="section-title">CARRIER NOTIFICATION TO:</div>
-        <label>To <button class="cm" data-field="carrier_to" title="Add comment">💬</button> <span class="count" id="cnt_carrier_to"></span></label>
-        <textarea id="carrier_to" placeholder="Expeditors International GmbH&#10;Mönchhofallee 10&#10;65479 RAUNHEIM&#10;GERMANY"></textarea>
+        <div class="muted">Confidence & checks will appear here after upload.</div>
       </div>
     </div>
-
-    <div class="row">
-      <div><label>Your Partner <button class="cm" data-field="your_partner">💬</button> <span class="count" id="cnt_your_partner"></span></label><input id="your_partner"/></div>
-      <div><label>Telephone <button class="cm" data-field="shipper_phone">💬</button> <span class="count" id="cnt_shipper_phone"></span></label><input id="shipper_phone"/></div>
-    </div>
-    <div class="row">
-      <div><label>Email <button class="cm" data-field="shipper_email">💬</button> <span class="count" id="cnt_shipper_email"></span></label><input id="shipper_email"/></div>
-      <div></div>
-    </div>
-
-    <div class="row">
-      <div><label>Shipment No. <button class="cm" data-field="shipment_no">💬</button> <span class="count" id="cnt_shipment_no"></span></label><input id="shipment_no"/></div>
-      <div><label>Order No. <button class="cm" data-field="order_no">💬</button> <span class="count" id="cnt_order_no"></span></label><input id="order_no"/></div>
-    </div>
-    <div class="row">
-      <div><label>Delivery No. <button class="cm" data-field="delivery_no">💬</button> <span class="count" id="cnt_delivery_no"></span></label><input id="delivery_no"/></div>
-      <div></div>
-    </div>
-    <div class="row">
-      <div><label>Loading Date <button class="cm" data-field="loading_date">💬</button> <span class="count" id="cnt_loading_date"></span></label><input id="loading_date" placeholder="dd.mm.yyyy"/></div>
-      <div><label>Sched. Delivery Date <button class="cm" data-field="scheduled_delivery_date">💬</button> <span class="count" id="cnt_scheduled_delivery_date"></span></label><input id="scheduled_delivery_date" placeholder="dd.mm.yyyy"/></div>
-    </div>
-    <div class="row">
-      <div><label>PO No. <button class="cm" data-field="po_no">💬</button> <span class="count" id="cnt_po_no"></span></label><input id="po_no"/></div>
-      <div><label>Order Label <button class="cm" data-field="order_label">💬</button> <span class="count" id="cnt_order_label"></span></label><input id="order_label"/></div>
-    </div>
-
-    <div class="section-title" style="margin-top:8px">Shipping Point</div>
-    <div class="row4">
-      <div><label>Street <button class="cm" data-field="shipping_street">💬</button> <span class="count" id="cnt_shipping_street"></span></label><input id="shipping_street" placeholder="Titanstrasse, Gebäude B3"/></div>
-      <div><label>Postal <button class="cm" data-field="shipping_postal">💬</button> <span class="count" id="cnt_shipping_postal"></span></label><input id="shipping_postal" placeholder="26954"/></div>
-      <div><label>City <button class="cm" data-field="shipping_city">💬</button> <span class="count" id="cnt_shipping_city"></span></label><input id="shipping_city" placeholder="Nordenham"/></div>
-      <div><label>Country <button class="cm" data-field="shipping_country">💬</button> <span class="count" id="cnt_shipping_country"></span></label><input id="shipping_country" placeholder="Germany"/></div>
-    </div>
-
-    <div class="row" style="margin-top:8px">
-      <div><label>Way of Forwarding <button class="cm" data-field="way_of_forwarding">💬</button> <span class="count" id="cnt_way_of_forwarding"></span></label><input id="way_of_forwarding"/></div>
-      <div><label>Delivery Terms <button class="cm" data-field="delivery_terms">💬</button> <span class="count" id="cnt_delivery_terms"></span></label><input id="delivery_terms"/></div>
-    </div>
   </div>
 
+  <!-- 1. Shipper (Exporter) -->
   <div class="card">
-    <div class="section-title">Consignee</div>
-    <label>Address <button class="cm" data-field="consignee_address">💬</button> <span class="count" id="cnt_consignee_address"></span></label>
-    <textarea id="consignee_address" placeholder="Enter Consignee address"></textarea>
-    <div class="row3">
-      <div><label>Customer No. <button class="cm" data-field="customer_no">💬</button> <span class="count" id="cnt_customer_no"></span></label><input id="customer_no"/></div>
-      <div><label>VAT No. <button class="cm" data-field="vat_no">💬</button> <span class="count" id="cnt_vat_no"></span></label><input id="vat_no" placeholder="EL-094158104"/></div>
-      <div><label>Customer PO No. <button class="cm" data-field="customer_po">💬</button> <span class="count" id="cnt_customer_po"></span></label><input id="customer_po"/></div>
-    </div>
-    <div class="row">
-      <div><label>Customer Contact <button class="cm" data-field="customer_contact">💬</button> <span class="count" id="cnt_customer_contact"></span></label><input id="customer_contact"/></div>
-      <div><label>Customer Phone Number <button class="cm" data-field="customer_phone">💬</button> <span class="count" id="cnt_customer_phone"></span></label><input id="customer_phone"/></div>
-    </div>
-    <div class="row">
-      <div><label>Customer Email <button class="cm" data-field="customer_email">💬</button> <span class="count" id="cnt_customer_email"></span></label><input id="customer_email"/></div>
-      <div></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="section-title">Notify Parties</div>
-    <div class="row">
+    <h2>1. Shipper (Exporter)</h2>
+    <div class="grid2">
       <div>
-        <label>Notify 1 (Address) <button class="cm" data-field="notify1_address">💬</button> <span class="count" id="cnt_notify1_address"></span></label>
-        <textarea id="notify1_address" placeholder="Enter Notify Party 1 address"></textarea>
-        <div class="row">
-          <div><label>Notify 1 Email <button class="cm" data-field="notify1_email">💬</button> <span class="count" id="cnt_notify1_email"></span></label><input id="notify1_email" placeholder="name@domain.com"/></div>
-          <div><label>Notify 1 Phone <button class="cm" data-field="notify1_phone">💬</button> <span class="count" id="cnt_notify1_phone"></span></label><input id="notify1_phone" placeholder="+30 ..."/></div>
-        </div>
+        <label>Company name <button class="cm" data-field="your_partner">💬</button> <span class="count" id="cnt_your_partner"></span></label>
+        <input id="shipper_company" placeholder="Company name"/>
       </div>
       <div>
-        <label>Notify 2 (Address) <button class="cm" data-field="notify2_address">💬</button> <span class="count" id="cnt_notify2_address"></span></label>
-        <textarea id="notify2_address" placeholder="Enter Notify Party 2 address"></textarea>
-        <div class="row">
-          <div><label>Notify 2 Email <button class="cm" data-field="notify2_email">💬</button> <span class="count" id="cnt_notify2_email"></span></label><input id="notify2_email" placeholder=""/></div>
-          <div><label>Notify 2 Phone <button class="cm" data-field="notify2_phone">💬</button> <span class="count" id="cnt_notify2_phone"></span></label><input id="notify2_phone" placeholder=""/></div>
-        </div>
+        <label>Contact person <button class="cm" data-field="shipper_contact">💬</button> <span class="count" id="cnt_shipper_contact"></span></label>
+        <input id="shipper_contact" placeholder="Full name"/>
+      </div>
+    </div>
+    <label>Address</label>
+    <textarea id="shipper_address" placeholder="Street, Postal, City, Country"></textarea>
+    <div class="grid2">
+      <div>
+        <label>Email / Phone <button class="cm" data-field="shipper_email">💬</button> <span class="count" id="cnt_shipper_email"></span></label>
+        <input id="shipper_email" placeholder="email@company.com"/>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <input id="shipper_phone" placeholder="+.. ... ..."/>
+      </div>
+    </div>
+    <div class="grid2">
+      <div>
+        <label>VAT / EORI / Tax ID <button class="cm" data-field="vat_no">💬</button> <span class="count" id="cnt_vat_no"></span></label>
+        <input id="vat_no" placeholder="EL-094158104"/>
+      </div>
+      <div></div>
+    </div>
+  </div>
+
+  <!-- 2. Consignee -->
+  <div class="card">
+    <h2>2. Consignee</h2>
+    <div class="grid2">
+      <div>
+        <label>Company name <button class="cm" data-field="consignee_address">💬</button> <span class="count" id="cnt_consignee_address"></span></label>
+        <input id="consignee_company" placeholder="Company name"/>
+      </div>
+      <div>
+        <label>Contact person <button class="cm" data-field="customer_contact">💬</button> <span class="count" id="cnt_customer_contact"></span></label>
+        <input id="customer_contact" placeholder="Full name"/>
+      </div>
+    </div>
+    <label>Address</label>
+    <textarea id="consignee_address" placeholder="Street, Postal, City, Country"></textarea>
+    <div class="grid2">
+      <div>
+        <label>Email / Phone <button class="cm" data-field="customer_email">💬</button> <span class="count" id="cnt_customer_email"></span></label>
+        <input id="customer_email" placeholder="email@company.com"/>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <input id="customer_phone" placeholder="+.. ... ..."/>
+      </div>
+    </div>
+    <div class="grid2">
+      <div>
+        <label>Importer tax ID (if required)</label>
+        <input id="importer_tax_id" placeholder=""/>
+      </div>
+      <div>
+        <label>Customer No. <button class="cm" data-field="customer_no">💬</button> <span class="count" id="cnt_customer_no"></span></label>
+        <input id="customer_no" placeholder=""/>
       </div>
     </div>
   </div>
 
+  <!-- 3. Notify Party -->
+  <div class="card">
+    <h2>3. Notify Party (if different)</h2>
+    <div class="grid2">
+      <div>
+        <label>Company name</label>
+        <input id="notify_company" placeholder="Company name"/>
+      </div>
+      <div>
+        <label>Contact person</label>
+        <input id="notify_contact" placeholder="Full name"/>
+      </div>
+    </div>
+    <label>Address <button class="cm" data-field="notify1_address">💬</button> <span class="count" id="cnt_notify1_address"></span></label>
+    <textarea id="notify1_address" placeholder="Street, Postal, City, Country"></textarea>
+    <div class="grid2">
+      <div>
+        <label>Email / Phone <button class="cm" data-field="notify1_email">💬</button> <span class="count" id="cnt_notify1_email"></span></label>
+        <input id="notify1_email" placeholder="email@company.com"/>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <input id="notify1_phone" placeholder="+.. ... ..."/>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. Shipment References -->
+  <div class="card">
+    <h2>4. Shipment References</h2>
+    <div class="grid2">
+      <div>
+        <label>Shipment No. <button class="cm" data-field="shipment_no">💬</button> <span class="count" id="cnt_shipment_no"></span></label>
+        <input id="shipment_no"/>
+      </div>
+      <div>
+        <label>Customer Order / PO No. <button class="cm" data-field="po_no">💬</button> <span class="count" id="cnt_po_no"></span></label>
+        <input id="po_no"/>
+      </div>
+    </div>
+    <div class="grid2">
+      <div>
+        <label>Delivery No(s). <button class="cm" data-field="delivery_no">💬</button> <span class="count" id="cnt_delivery_no"></span></label>
+        <input id="delivery_no"/>
+      </div>
+      <div>
+        <label>Customer No. (if applicable) <button class="cm" data-field="customer_no">💬</button></label>
+        <input id="customer_no_ref"/>
+      </div>
+    </div>
+  </div>
+
+  <!-- 5. Shipment Details -->
+  <div class="card">
+    <h2>5. Shipment Details</h2>
+    <div class="grid2">
+      <div>
+        <label>Shipping Point (factory/warehouse)</label>
+        <textarea id="shipping_point_text" placeholder="Titanstrasse, Gebäude B3&#10;26954 Nordenham&#10;Germany"></textarea>
+      </div>
+      <div>
+        <div class="grid2">
+          <div>
+            <label>Port of Loading (POL)</label>
+            <input id="pol"/>
+          </div>
+          <div>
+            <label>Port of Discharge (POD)</label>
+            <input id="pod"/>
+          </div>
+        </div>
+        <label style="margin-top:8px">Delivery Terms (Incoterm + location) <button class="cm" data-field="delivery_terms">💬</button> <span class="count" id="cnt_delivery_terms"></span></label>
+        <input id="delivery_terms" placeholder="DAP Athens, GR"/>
+        <label style="margin-top:8px">Way of Forwarding <button class="cm" data-field="way_of_forwarding">💬</button> <span class="count" id="cnt_way_of_forwarding"></span></label>
+        <input id="way_of_forwarding" placeholder="SEA / FCL"/>
+      </div>
+    </div>
+    <div class="grid2" style="margin-top:8px">
+      <div>
+        <label>Loading Date <button class="cm" data-field="loading_date">💬</button> <span class="count" id="cnt_loading_date"></span></label>
+        <input id="loading_date" placeholder="dd.mm.yyyy"/>
+      </div>
+      <div>
+        <label>Scheduled Delivery Date <button class="cm" data-field="scheduled_delivery_date">💬</button> <span class="count" id="cnt_scheduled_delivery_date"></span></label>
+        <input id="scheduled_delivery_date" placeholder="dd.mm.yyyy"/>
+      </div>
+    </div>
+    <label style="margin-top:8px">Final Delivery Address</label>
+    <textarea id="final_delivery_address" placeholder="If different from consignee"></textarea>
+  </div>
+
+  <!-- 6. Cargo Details -->
   <div class="card" id="goodsCard">
-    <div class="section-title">Goods Information</div>
+    <h2>6. Cargo Details</h2>
     <div id="products"></div>
     <button class="btn-link" type="button" id="addProduct">+ Add Product</button>
+    <div class="grid3" style="margin-top:8px">
+      <div>
+        <label>HS Code <button class="cm" data-field="hs_code">💬</button> <span class="count" id="cnt_hs_code"></span></label>
+        <input id="hs_code"/>
+      </div>
+      <div>
+        <label>Net weight (kg)</label>
+        <input id="total_net_kg" placeholder="e.g. 24000"/>
+      </div>
+      <div>
+        <label>Gross weight (kg)</label>
+        <input id="total_gross_kg" placeholder="e.g. 24500"/>
+      </div>
+    </div>
+    <div class="grid2" style="margin-top:8px">
+      <div>
+        <label>Volume (CBM)</label>
+        <input id="volume_cbm" placeholder="e.g. 28.0"/>
+      </div>
+      <div>
+        <label>Special handling instructions</label>
+        <input id="special_handling" placeholder="e.g. Keep dry"/>
+      </div>
+    </div>
   </div>
 
+  <!-- 7. Marks & Numbers -->
   <div class="card">
-    <div class="section-title">B/L Remarks & Instructions</div>
-    <label>Remarks <button class="cm" data-field="bl_remarks">💬</button> <span class="count" id="cnt_bl_remarks"></span></label>
-    <textarea id="bl_remarks" placeholder="Marks, Labelling, special instructions will appear here when present in the PDF."></textarea>
-    <label style="margin-top:8px">HS Code <button class="cm" data-field="hs_code">💬</button> <span class="count" id="cnt_hs_code"></span></label>
-    <input id="hs_code"/>
+    <h2>7. Marks & Numbers</h2>
+    <label>Carton/pallet marks</label>
+    <textarea id="marks_text" placeholder="Carton/pallet marks"></textarea>
+    <label style="margin-top:8px">Labelling text (if applicable)</label>
+    <textarea id="labelling_text" placeholder="Labelling text"></textarea>
   </div>
 
+  <!-- 8. Bill of Lading Instructions -->
   <div class="card">
-    <div class="footer-row">
+    <h2>8. Bill of Lading Instructions</h2>
+    <div class="grid3">
+      <div>
+        <label>B/L type (Original / Express / Seaway)</label>
+        <input id="bl_type" placeholder="e.g. Express"/>
+      </div>
+      <div>
+        <label>Number of originals required</label>
+        <input id="bl_originals" placeholder="e.g. 0"/>
+      </div>
+      <div>
+        <label>Remarks <button class="cm" data-field="bl_remarks">💬</button> <span class="count" id="cnt_bl_remarks"></span></label>
+        <input id="bl_remarks" placeholder="B/L remarks"/>
+      </div>
+    </div>
+  </div>
+
+  <!-- 9. Contacts for Coordination -->
+  <div class="card">
+    <h2>9. Contacts for Coordination</h2>
+    <div class="grid2">
+      <div>
+        <label>Forwarder contact (if known)</label>
+        <textarea id="forwarder_contact" placeholder="Company / person / email / phone"></textarea>
+      </div>
+      <div>
+        <label>Buyer/agent contact at destination</label>
+        <textarea id="destination_contact" placeholder="Company / person / email / phone"></textarea>
+      </div>
+    </div>
+  </div>
+
+  <!-- Signature -->
+  <div class="card">
+    <div class="grid2">
       <div>
         <div class="muted">Sincerely,</div>
         <label>Your Name <button class="cm" data-field="signature_name">💬</button> <span class="count" id="cnt_signature_name"></span></label>
@@ -903,6 +1043,7 @@ app.get("/", (_req, res) => {
     </div>
   </div>
 
+  <!-- Actions -->
   <div class="card">
     <div class="toolbar">
       <button class="btn" type="button" id="saveDraftBtn" disabled>Save Draft</button>
@@ -913,8 +1054,9 @@ app.get("/", (_req, res) => {
     <div id="saveStatus" class="status"></div>
   </div>
 
+  <!-- Past -->
   <div class="card list">
-    <div class="section-title">Past Notifications</div>
+    <div class="muted" style="margin-bottom:8px">Past Notifications</div>
     <div id="recent"></div>
   </div>
 </div>
@@ -943,19 +1085,16 @@ function makeProductCard(idx, data){
     +   '<strong>Product ' + (idx+1) + '</strong>'
     +   '<button class="btn-link" type="button">Remove Product</button>'
     + '</header>'
-    + '<label>Product Name</label>'
+    + '<label>Product description (commercial name + grade/type)</label>'
     + '<input name="product_name" value="' + (data.product_name||'') + '">'
-    + '<div class="row">'
+    + '<div class="grid3">'
     +   '<div><label>Net Weight (KG)</label><input name="net_kg" value="' + (data.net_kg||'') + '"></div>'
     +   '<div><label>Gross Weight (KG)</label><input name="gross_kg" value="' + (data.gross_kg||'') + '"></div>'
-    + '</div>'
-    + '<div class="row">'
     +   '<div><label>No. Packages</label><input name="pkgs" value="' + (data.pkgs||'') + '"></div>'
-    +   '<div><label>Packaging</label><input name="packaging" value="' + (data.packaging||'') + '"></div>'
     + '</div>'
-    + '<div class="row">'
+    + '<div class="grid2" style="margin-top:8px">'
+    +   '<div><label>Packaging details</label><input name="packaging" value="' + (data.packaging||'') + '"></div>'
     +   '<div><label>Pallets</label><input name="pallets" value="' + (data.pallets||'') + '"></div>'
-    +   '<div></div>'
     + '</div>';
   div.innerHTML = html;
   div.querySelector('button').onclick = function(){
@@ -984,7 +1123,6 @@ async function handleFiles(files){
     var ctrl = new AbortController();
     var to = setTimeout(function(){ ctrl.abort(); }, 180000);
 
-    // nocache=1 → always create/use a draft from this upload
     var r = await fetch("/api/upload?nocache=1", { method: "POST", body: fd, signal: ctrl.signal });
     clearTimeout(to);
 
@@ -1016,7 +1154,6 @@ async function handleFiles(files){
 
     fillForm(js);
 
-    // NEW: show evidence as tooltip/badge if present
     if (Array.isArray(js.evidence)) {
       const byField = {};
       js.evidence.forEach(e => { (byField[e.field] ||= []).push(e); });
@@ -1037,49 +1174,74 @@ async function handleFiles(files){
 function setVal(id, val){ var el = document.getElementById(id); if(el) el.value = val || ""; }
 
 function fillForm(d){
-  setVal("carrier_to", d.carrier_to);
-  setVal("your_partner", d.your_partner);
-  setVal("shipper_phone", d.shipper_phone);
+  // Shipper
+  setVal("shipper_company", d.your_partner);
+  setVal("shipper_contact", (d.extras && d.extras.shipper_contact) || "");
+  setVal("shipper_address", (d.extras && d.extras.shipper_address) || "");
   setVal("shipper_email", d.shipper_email);
-
-  setVal("shipment_no", d.shipment_no);
-  setVal("order_no", d.order_no);
-  setVal("delivery_no", d.delivery_no);
-  setVal("loading_date", d.loading_date);
-  setVal("scheduled_delivery_date", d.scheduled_delivery_date);
-  setVal("po_no", d.po_no);
-  setVal("order_label", d.order_label);
-
-  setVal("shipping_street", d.shipping_street);
-  setVal("shipping_postal", d.shipping_postal);
-  setVal("shipping_city", d.shipping_city);
-  setVal("shipping_country", d.shipping_country);
-
-  setVal("way_of_forwarding", d.way_of_forwarding);
-  setVal("delivery_terms", d.delivery_terms);
-
-  setVal("consignee_address", d.consignee_address);
-  setVal("customer_no", d.customer_no);
+  setVal("shipper_phone", d.shipper_phone);
   setVal("vat_no", d.vat_no);
-  setVal("customer_po", d.customer_po);
-  setVal("customer_contact", d.customer_contact);
-  setVal("customer_phone", d.customer_phone);
-  setVal("customer_email", d.customer_email);
 
+  // Consignee
+  setVal("consignee_company", (d.extras && d.extras.consignee_company) || "");
+  setVal("customer_contact", d.customer_contact);
+  setVal("consignee_address", d.consignee_address);
+  setVal("customer_email", d.customer_email);
+  setVal("customer_phone", d.customer_phone);
+  setVal("importer_tax_id", (d.extras && d.extras.importer_tax_id) || "");
+  setVal("customer_no", d.customer_no);
+
+  // Notify
+  setVal("notify_company", (d.extras && d.extras.notify_company) || "");
+  setVal("notify_contact", (d.extras && d.extras.notify_contact) || "");
   setVal("notify1_address", d.notify1_address);
   setVal("notify1_email", d.notify1_email);
   setVal("notify1_phone", d.notify1_phone);
-  setVal("notify2_address", d.notify2_address);
-  setVal("notify2_email", d.notify2_email);
-  setVal("notify2_phone", d.notify2_phone);
 
-  setVal("bl_remarks", d.bl_remarks);
+  // References
+  setVal("shipment_no", d.shipment_no);
+  setVal("po_no", d.po_no || d.order_label);
+  setVal("delivery_no", d.delivery_no);
+  setVal("customer_no_ref", d.customer_no);
+
+  // Shipment details
+  const spCombined = [d.shipping_street, d.shipping_postal && (d.shipping_postal + " " + (d.shipping_city||"")), d.shipping_country].filter(Boolean).join("\\n");
+  setVal("shipping_point_text", spCombined);
+  setVal("pol", (d.extras && d.extras.pol) || "");
+  setVal("pod", (d.extras && d.extras.pod) || "");
+  setVal("delivery_terms", d.delivery_terms);
+  setVal("way_of_forwarding", d.way_of_forwarding);
+  setVal("loading_date", d.loading_date);
+  setVal("scheduled_delivery_date", d.scheduled_delivery_date);
+  setVal("final_delivery_address", (d.extras && d.extras.final_delivery_address) || "");
+
+  // Cargo details
   setVal("hs_code", d.hs_code);
+  setVal("total_net_kg", d.total_net_kg);
+  setVal("total_gross_kg", d.total_gross_kg);
+  setVal("volume_cbm", (d.extras && d.extras.volume_cbm) || "");
+  setVal("special_handling", (d.extras && d.extras.special_handling) || "");
+
+  // Marks & Numbers
+  setVal("marks_text", (d.extras && d.extras.marks_text) || "");
+  setVal("labelling_text", (d.extras && d.extras.labelling_text) || "");
+
+  // B/L
+  setVal("bl_type", (d.extras && d.extras.bl_type) || "");
+  setVal("bl_originals", (d.extras && d.extras.bl_originals) || "");
+  setVal("bl_remarks", d.bl_remarks);
+
+  // Contacts
+  setVal("forwarder_contact", (d.extras && d.extras.forwarder_contact) || "");
+  setVal("destination_contact", (d.extras && d.extras.destination_contact) || "");
+
+  // Signature
   setVal("signature_name", d.signature_name);
   setVal("signature_date", d.signature_date || new Date().toISOString().slice(0,10));
 
+  // Items
   prodWrap.innerHTML = "";
-  var items = (d.items && d.items.length) ? d.items : [{},{}];
+  var items = (d.items && d.items.length) ? d.items : [{}];
   for (var i=0;i<items.length;i++) addProduct(items[i]);
 
   loadRecent();
@@ -1130,24 +1292,62 @@ document.getElementById("freezeBtn").addEventListener("click", async function(){
 });
 
 function collectForm(){
+  // Combine shipping point into structured fields if user edited the textarea (best-effort)
+  var sp = ($("#shipping_point_text").value||"").split(/\\n+/);
+  var spStreet = sp[0]||"", spPostal="", spCity="", spCountry="";
+  if (sp[1]) {
+    var m = sp[1].match(/(\\d{3,10})\\s+(.+)/);
+    if (m) { spPostal = m[1]; spCity = m[2]; }
+  }
+  if (sp[2]) spCountry = sp[2];
+
+  // Build extras without breaking existing DB schema
+  var extras = {
+    shipper_company: $("#shipper_company").value,
+    shipper_contact: $("#shipper_contact").value,
+    shipper_address: $("#shipper_address").value,
+    consignee_company: $("#consignee_company").value,
+    importer_tax_id: $("#importer_tax_id").value,
+    notify_company: $("#notify_company").value,
+    notify_contact: $("#notify_contact").value,
+    pol: $("#pol").value,
+    pod: $("#pod").value,
+    final_delivery_address: $("#final_delivery_address").value,
+    volume_cbm: $("#volume_cbm").value,
+    special_handling: $("#special_handling").value,
+    marks_text: $("#marks_text").value,
+    labelling_text: $("#labelling_text").value,
+    bl_type: $("#bl_type").value,
+    bl_originals: $("#bl_originals").value,
+    forwarder_contact: $("#forwarder_contact").value,
+    destination_contact: $("#destination_contact").value
+  };
+
+  // Merge marks/labelling into bl_remarks preview (non-destructive)
+  var blExtra = "";
+  if (extras.marks_text) blExtra += (blExtra ? "\\n\\n" : "") + "MARKS:\\n" + extras.marks_text;
+  if (extras.labelling_text) blExtra += (blExtra ? "\\n\\n" : "") + "LABELLING:\\n" + extras.labelling_text;
+  var blCombined = ($("#bl_remarks").value||"").trim();
+  if (blExtra) blCombined = (blCombined ? (blCombined + "\\n\\n") : "") + blExtra;
+
   return {
-    carrier_to: $("#carrier_to").value,
-    your_partner: $("#your_partner").value,
+    // existing fields (server/DB know these)
+    your_partner: $("#shipper_company").value || $("#your_partner")?.value || "",
     shipper_phone: $("#shipper_phone").value,
     shipper_email: $("#shipper_email").value,
 
     shipment_no: $("#shipment_no").value,
-    order_no: $("#order_no").value,
+    order_no: $("#po_no").value, // keep mapping
     delivery_no: $("#delivery_no").value,
     loading_date: $("#loading_date").value,
     scheduled_delivery_date: $("#scheduled_delivery_date").value,
     po_no: $("#po_no").value,
-    order_label: $("#order_label").value,
+    order_label: $("#po_no").value,
 
-    shipping_street: $("#shipping_street").value,
-    shipping_postal: $("#shipping_postal").value,
-    shipping_city: $("#shipping_city").value,
-    shipping_country: $("#shipping_country").value,
+    shipping_street: spStreet,
+    shipping_postal: spPostal,
+    shipping_city: spCity,
+    shipping_country: spCountry,
 
     way_of_forwarding: $("#way_of_forwarding").value,
     delivery_terms: $("#delivery_terms").value,
@@ -1155,7 +1355,7 @@ function collectForm(){
     consignee_address: $("#consignee_address").value,
     customer_no: $("#customer_no").value,
     vat_no: $("#vat_no").value,
-    customer_po: $("#customer_po").value,
+    customer_po: $("#po_no").value,
     customer_contact: $("#customer_contact").value,
     customer_phone: $("#customer_phone").value,
     customer_email: $("#customer_email").value,
@@ -1163,12 +1363,16 @@ function collectForm(){
     notify1_address: $("#notify1_address").value,
     notify1_email: $("#notify1_email").value,
     notify1_phone: $("#notify1_phone").value,
-    notify2_address: $("#notify2_address").value,
-    notify2_email: $("#notify2_email").value,
-    notify2_phone: $("#notify2_phone").value,
+    notify2_address: "",
+    notify2_email: "",
+    notify2_phone: "",
 
-    bl_remarks: $("#bl_remarks").value,
+    total_net_kg: parseFloat($("#total_net_kg").value || 0) || null,
+    total_gross_kg: parseFloat($("#total_gross_kg").value || 0) || null,
+    total_pkgs: null,
+    bl_remarks: blCombined,
     hs_code: $("#hs_code").value,
+
     signature_name: $("#signature_name").value,
     signature_date: $("#signature_date").value,
 
@@ -1181,7 +1385,10 @@ function collectForm(){
         packaging: div.querySelector('input[name="packaging"]').value || null,
         pallets: parseInt(div.querySelector('input[name="pallets"]').value || 0) || null
       };
-    })
+    }),
+
+    // NEW: keep non-DB fields safely
+    extras: extras
   };
 }
 
@@ -1244,12 +1451,13 @@ async function loadRecent(){
   }
 }
 
-// initial defaults
+// defaults
 document.getElementById("signature_date").value = new Date().toISOString().slice(0,10);
 loadRecent();
 </script>
 </body></html>`);
 });
+
 
 // ---------- API ----------
 app.get("/api/health", (_req, res) => {
