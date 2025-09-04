@@ -8,15 +8,18 @@
     "start": "node dragdrop-pdf-carrier-instruction-app.js",
     "build": "echo \"no build step\""
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "better-sqlite3": "^9.6.0",
     "dayjs": "^1.11.11",
-    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.2",
-    "nanoid": "^5.0.7",
-    "openai": "^4.57.0",
-    "pdf-parse": "^1.1.1"
+    "nanoid": "^3.3.7",
+    "nodemailer": "^6.9.14",
+    "pdf-parse": "^1.1.1",
+    "dotenv": "^16.4.5",
+    "openai": "^4.57.0"
   }
 }
