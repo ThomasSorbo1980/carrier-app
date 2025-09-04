@@ -1,8 +1,16 @@
 {
   "name": "carrier-app",
   "version": "1.0.0",
-  "main": "dragdrop-pdf-carrier-instruction-app.js",
   "license": "MIT",
+  "main": "dragdrop-pdf-carrier-instruction-app.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node dragdrop-pdf-carrier-instruction-app.js",
+    "build": "echo \"no build step\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "better-sqlite3": "^9.6.0",
     "dayjs": "^1.11.11",
@@ -10,6 +18,7 @@
     "multer": "^1.4.5-lts.2",
     "nanoid": "^5.0.7",
     "pdf-parse": "^1.1.1",
-    "nodemailer": "^6.9.14"
+    "openai": "^4.57.0",
+    "dotenv": "^16.4.5"
   }
 }
