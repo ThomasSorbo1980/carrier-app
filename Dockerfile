@@ -13,11 +13,11 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy package.json (and lockfile if present)
-COPY package.json package-lock.json* ./
+# Copy package.json only (since no lockfile)
+COPY package.json ./
 
-# Install dependencies
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
+# Install dependencies (production only)
+RUN npm install --omit=dev
 
 # Copy rest of the project
 COPY . .
