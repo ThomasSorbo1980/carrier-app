@@ -1,8 +1,7 @@
 services:
   - type: web
     name: carrier-app
-    env: node
+    env: docker
     plan: starter
-    buildCommand: "npm ci"
-    startCommand: "npm start"
+    autoDeploy: true
     healthCheckPath: /api/health
