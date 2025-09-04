@@ -1,3 +1,4 @@
+require('dotenv').config();
 /**
  * Carrier Notification Letter (with Drafts, Comments, Freeze)
  * - PDF → Draft v1 (server) → Review w/ comments → Freeze → Final shipment
