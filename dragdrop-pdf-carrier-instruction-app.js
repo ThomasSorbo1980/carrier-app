@@ -4,7 +4,7 @@
  * - This version adds optional OpenAI JSON extraction/refinement.
  *
  * ENV:
- *   OPENAI_API_KEY=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
+ *   OPENAI_API_KEY=sk-...
  *   USE_OPENAI_EXTRACT=1                 # turn on model-assisted extraction
  *   OPENAI_MODEL=gpt-4o-mini             # optional, defaults to gpt-4o-mini
  *   SQLITE_DB_PATH=shipments.db          # optional
