@@ -733,8 +733,6 @@ async function openaiExtract({ textBest, alternates, seedFields }) {
 
 // ---------- UI ----------
 app.get("/", (_req, res) => {
-// ---------- UI (drop-in replacement) ----------
-app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="en">
 <head>
