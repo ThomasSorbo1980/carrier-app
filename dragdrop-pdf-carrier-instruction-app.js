@@ -1,6 +1,13 @@
 /**
  * Carrier Notification Letter (with Drafts, Comments, Freeze)
  * - PDF → Draft v1 (server) → Review w/ comments → Freeze → Final shipment
+ * - This version adds optional OpenAI JSON extraction/refinement.
+ *
+ * ENV:
+ *   OPENAI_API_KEY=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
+ *   USE_OPENAI_EXTRACT=1                 # turn on model-assisted extraction
+ *   OPENAI_MODEL=gpt-4o-mini             # optional, defaults to gpt-4o-mini
+ *   SQLITE_DB_PATH=shipments.db          # optional
  */
 
 const express = require("express");
@@ -14,6 +21,18 @@ const fs = require("fs");
 const os = require("os");
 const { execFile } = require("child_process");
 const crypto = require("crypto");
+
+// ---------- NEW: OpenAI (optional) ----------
+const useOpenAI = !!process.env.USE_OPENAI_EXTRACT && !!process.env.OPENAI_API_KEY;
+let OpenAI = null;
+if (useOpenAI) {
+  try {
+    OpenAI = require("openai");
+  } catch (e) {
+    console.warn("OpenAI client not installed. Run: npm i openai");
+  }
+}
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 // ---------- DB ----------
 const DB_PATH = process.env.SQLITE_DB_PATH || "shipments.db";
@@ -86,18 +105,19 @@ db.prepare(`
     hash TEXT PRIMARY KEY,
     text TEXT,
     parsed TEXT,
-    created_at TEXT
+    created_at TEXT,
+    llm_json TEXT
   )
 `).run();
 
-/* NEW: Draft versions of a shipment before freezing */
+/* Drafts */
 db.prepare(`
   CREATE TABLE IF NOT EXISTS drafts (
     id TEXT PRIMARY KEY,
-    base_hash TEXT,           -- PDF hash to dedupe
-    version_no INTEGER,       -- starts at 1
-    status TEXT,              -- 'draft' | 'frozen'
-    data_json TEXT,           -- serialized fields object (incl. items)
+    base_hash TEXT,
+    version_no INTEGER,
+    status TEXT,
+    data_json TEXT,
     created_at TEXT,
     updated_at TEXT
   )
@@ -108,7 +128,7 @@ db.prepare(`
   ON drafts (base_hash, version_no)
 `).run();
 
-/* NEW: Per-field comments for a draft */
+/* Comments */
 db.prepare(`
   CREATE TABLE IF NOT EXISTS comments (
     id TEXT PRIMARY KEY,
@@ -304,7 +324,8 @@ async function extractTextFromBuffer(pdfBuffer) {
   });
 
   const pPdfParse = (async () => { try { const a = await pdfParse(pdfBuffer); return a?.text || ""; } catch { return ""; } })();
-  const pPdftotext = run("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
+  // prefer bbox-layout (richer structure); keep classic layout as alternate later when we re-run in /api/upload
+  const pPdftotext = run("pdftotext", ["-bbox-layout", "-enc", "UTF-8", "-nopgbrk", "-q", pdfPath, "-"]);
   const pOCR = (async () => {
     try {
       const ppmPrefix = path.join(os.tmpdir(), "carrier-" + nanoid());
@@ -318,8 +339,9 @@ async function extractTextFromBuffer(pdfBuffer) {
         const inP = path.join(dir, f), outP = path.join(dir, "prep-" + f);
         await run("convert", [inP, "-deskew", "40%", "-strip", "-colorspace", "Gray",
                               "-contrast-stretch", "1%x1%", "-brightness-contrast", "10x15",
-                              "-sharpen", "0x1", outP]);
-        ocrText += "\n" + await run("tesseract", [outP, "stdout", "--psm", "4"]);
+                              "-sharpen", "0x1", "-threshold", "60%", outP]);
+        // multi-lang helps (eng+deu common for these docs)
+        ocrText += "\n" + await run("tesseract", [outP, "stdout", "--psm", "4", "--oem", "1", "-l", "eng+deu"]);
       }
       return ocrText;
     } catch { return ""; }
@@ -443,7 +465,7 @@ function parseFieldsFromText(textRaw) {
   let customer_phone   = stripPrefix(grabNear(/Customer\s*Phone\s*Number/i, /([^\n]+)/i, full, 80));
   let customer_email   = findEmail(grabNear(/Customer\s*Email/i, /([^\n]+)/i, full, 140)) || "";
 
-  // Guard: never Kronos email / shipper phone as customer
+  // Guard
   if (/@kronosww\.com$/i.test(customer_email)) customer_email = "";
   if (customer_phone && shipper_phone && onlyDigits(customer_phone) === onlyDigits(shipper_phone)) {
     customer_phone = "";
@@ -563,6 +585,149 @@ function parseFieldsFromText(textRaw) {
 
     items
   };
+}
+
+// ---------- NEW: OpenAI JSON schema & reconciliation ----------
+const extractionSchema = {
+  name: "ShipmentExtraction",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      your_partner: { type: "string" },
+      shipper_phone: { type: "string" },
+      shipper_email: { type: "string" },
+      shipment_no: { type: "string" },
+      order_no: { type: "string" },
+      delivery_no: { type: "string" },
+      loading_date: { type: "string" },
+      scheduled_delivery_date: { type: "string" },
+      po_no: { type: "string" },
+      order_label: { type: "string" },
+      shipping_street: { type: "string" },
+      shipping_postal: { type: "string" },
+      shipping_city: { type: "string" },
+      shipping_country: { type: "string" },
+      way_of_forwarding: { type: "string" },
+      delivery_terms: { type: "string" },
+      carrier_to: { type: "string" },
+      consignee_address: { type: "string" },
+      customer_no: { type: "string" },
+      vat_no: { type: "string" },
+      customer_po: { type: "string" },
+      customer_contact: { type: "string" },
+      customer_phone: { type: "string" },
+      customer_email: { type: "string" },
+      notify1_address: { type: "string" },
+      notify1_email: { type: "string" },
+      notify1_phone: { type: "string" },
+      notify2_address: { type: "string" },
+      notify2_email: { type: "string" },
+      notify2_phone: { type: "string" },
+      total_net_kg: { type: ["number","null"] },
+      total_gross_kg: { type: ["number","null"] },
+      total_pkgs: { type: ["integer","null"] },
+      bl_remarks: { type: "string" },
+      hs_code: { type: "string" },
+      signature_name: { type: "string" },
+      signature_date: { type: "string" },
+      items: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            product_name: { type: "string" },
+            net_kg: { type: ["number","null"] },
+            gross_kg: { type: ["number","null"] },
+            pkgs: { type: ["integer","null"] },
+            packaging: { type: ["string","null"] },
+            pallets: { type: ["integer","null"] }
+          },
+          required: ["product_name"]
+        }
+      },
+      evidence: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            field: { type: "string" },
+            value: { type: "string" },
+            snippet: { type: "string" },
+            start: { type: ["integer","null"] },
+            end: { type: ["integer","null"] },
+            source: { type: "string" }
+          },
+          required: ["field","value","snippet","source"]
+        }
+      }
+    },
+    required: ["items"]
+  }
+};
+
+async function openaiExtract({ textBest, alternates, seedFields }) {
+  if (!useOpenAI || !OpenAI) return { ...seedFields, evidence: [] };
+
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const MAX = 120_000;
+  const best = (textBest || "").slice(0, MAX);
+  const p1 = (alternates?.pdfParse || "").slice(0, MAX);
+  const p2 = (alternates?.pdftotext || "").slice(0, MAX);
+  const p3 = (alternates?.ocr || "").slice(0, MAX);
+
+  const system = [
+    "You extract shipping fields from noisy PDFs.",
+    "Return STRICT JSON that matches the provided JSON Schema.",
+    "Prefer exact substrings; do not invent values.",
+    "Normalize dates to dd.mm.yyyy if possible; else yyyy-mm-dd.",
+    "Leave a field empty if uncertain; do not guess.",
+    "Provide evidence snippets for fields you populate."
+  ].join(" ");
+
+  const user = [
+    "PRIMARY TEXT:\n<<<", best, ">>>",
+    p1 ? "\n\nALT pdf-parse:\n<<<" + p1 + ">>>" : "",
+    p2 ? "\n\nALT pdftotext:\n<<<" + p2 + ">>>" : "",
+    p3 ? "\n\nALT ocr:\n<<<" + p3 + ">>>" : "",
+    "\n\nSEED FIELDS (regex parser output; you may correct):\n",
+    JSON.stringify(seedFields, null, 2)
+  ].join("");
+
+  const resp = await client.responses.create({
+    model: OPENAI_MODEL,
+    input: [
+      { role: "system", content: system },
+      { role: "user", content: user }
+    ],
+    response_format: {
+      type: "json_schema",
+      json_schema: extractionSchema
+    }
+  });
+
+  const out = resp.output_json ?? (() => {
+    try { return JSON.parse(resp.output_text || "{}"); } catch { return {}; }
+  })();
+
+  // Merge: keep seed defaults, prefer LLM non-empty values
+  const { evidence = [], ...llmFields } = out || {};
+  const final = { ...seedFields };
+  for (const [k, v] of Object.entries(llmFields)) {
+    if (k === "items") {
+      if (Array.isArray(v) && v.length) final.items = v;
+      continue;
+    }
+    if (v === null) continue;
+    if (typeof v === "string") {
+      if (v.trim()) final[k] = v;
+    } else {
+      final[k] = v;
+    }
+  }
+  return { ...final, evidence: Array.isArray(evidence) ? evidence : [] };
 }
 
 // ---------- UI ----------
@@ -833,7 +998,6 @@ async function handleFiles(files){
       return;
     }
 
-    // Expect draft info
     currentDraftId = js.draft_id || null;
     currentVersionNo = js.version_no || 1;
     if (currentDraftId) {
@@ -850,6 +1014,18 @@ async function handleFiles(files){
     statusEl.className = "status ok";
 
     fillForm(js);
+
+    // NEW: show evidence as tooltip/badge if present
+    if (Array.isArray(js.evidence)) {
+      const byField = {};
+      js.evidence.forEach(e => { (byField[e.field] ||= []).push(e); });
+      Object.keys(byField).forEach(field => {
+        const badge = document.getElementById("cnt_" + field);
+        if (!badge) return;
+        badge.title = byField[field].map(x => "[" + x.source + "] " + x.snippet).join("\\n\\n");
+        badge.textContent = (badge.textContent ? badge.textContent + " · " : "") + byField[field].length + " evidence";
+      });
+    }
   } catch (err) {
     statusEl.textContent = "Network/timeout: " + err.message;
     statusEl.className = "status err";
@@ -935,7 +1111,6 @@ document.getElementById("freezeBtn").addEventListener("click", async function(){
   saveStatus.textContent = "Freezing draft…";
   saveStatus.className = "status";
   try {
-    // ensure latest edits are captured
     const body = collectForm();
     await fetch("/api/draft/" + currentDraftId + "/save", {
       method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(body)
@@ -1009,7 +1184,7 @@ function collectForm(){
   };
 }
 
-// Comments: add handlers for all buttons .cm
+// Comments
 document.addEventListener("click", async function(e){
   const btn = e.target.closest(".cm");
   if (!btn) return;
@@ -1077,12 +1252,11 @@ loadRecent();
 
 // ---------- API ----------
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString(), db: DB_PATH });
+  res.json({ ok: true, time: new Date().toISOString(), db: DB_PATH, openai: !!useOpenAI });
 });
 
 /**
- * Upload: extract text → parse → create/find Draft v1 (by PDF hash)
- * Returns fields + { draft_id, version_no, status }
+ * Upload: extract text → parse → (optional OpenAI refine) → create/find Draft v1
  */
 app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
@@ -1091,16 +1265,45 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
     const hash = crypto.createHash("sha256").update(req.file.buffer).digest("hex");
 
     // Extract best text
-    const text = await extractTextFromBuffer(req.file.buffer);
-    if (!text || !text.trim()) {
+    const textBest = await extractTextFromBuffer(req.file.buffer);
+    if (!textBest || !textBest.trim()) {
       return res.status(422).json({ error: "Unable to extract text" });
     }
 
-    // Parse + score
-    const fields = parseFieldsFromText(text);
-    const { score, warnings } = validateAndScore(fields);
-    fields.confidence = score;
-    fields.warnings = warnings;
+    // Build alternates for model reconciliation (classic layout + pdf-parse)
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "carrier-"));
+    const pdfPath = path.join(tmp, "input.pdf"); fs.writeFileSync(pdfPath, req.file.buffer);
+    const run = (cmd, args) => new Promise((res) => execFile(cmd, args, { maxBuffer: 50 * 1024 * 1024 }, (err, out) => res(err ? "" : out.toString("utf8"))));
+    const pClassic = run("pdftotext", ["-layout", "-nopgbrk", "-q", pdfPath, "-"]);
+    const pParsed  = (async () => { try { const a = await pdfParse(req.file.buffer); return a?.text || ""; } catch { return ""; } })();
+
+    const [altClassic, altParsed] = await Promise.all([pClassic, pParsed]);
+    const alternates = { pdfParse: altParsed, pdftotext: altClassic, ocr: "" };
+
+    // Deterministic parse first
+    const seedFields = parseFieldsFromText(textBest);
+
+    // Optional OpenAI refinement
+    let llmJson = null;
+    let finalFields = seedFields;
+    let evidence = [];
+    if (useOpenAI && OpenAI) {
+      try {
+        const refined = await openaiExtract({ textBest, alternates, seedFields });
+        evidence = Array.isArray(refined.evidence) ? refined.evidence : [];
+        delete refined.evidence;
+        finalFields = refined;
+        llmJson = JSON.stringify({ ...refined, evidence }, null, 2);
+      } catch (e) {
+        console.error("LLM extraction failed; falling back to regex parse:", e);
+      }
+    }
+
+    // Score
+    const { score, warnings } = validateAndScore(finalFields);
+    finalFields.confidence = Math.min(100, score + Math.min(10, Math.floor((evidence.length || 0) / 5)));
+    finalFields.warnings = warnings;
+    finalFields.evidence = evidence;
 
     // Create or reuse Draft v1 for this hash
     let draft = db.prepare("SELECT * FROM drafts WHERE base_hash = ? AND version_no = 1").get(hash);
@@ -1109,19 +1312,18 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       const id = nanoid();
       db.prepare(`INSERT INTO drafts (id, base_hash, version_no, status, data_json, created_at, updated_at)
                   VALUES (?, ?, 1, 'draft', ?, ?, ?)`)
-        .run(id, hash, JSON.stringify(fields), now, now);
+        .run(id, hash, JSON.stringify(finalFields), now, now);
       draft = { id, base_hash: hash, version_no: 1, status: "draft" };
     } else {
-      // update server copy so reviewer sees latest parse
       db.prepare(`UPDATE drafts SET data_json = ?, updated_at = ? WHERE id = ?`)
-        .run(JSON.stringify(fields), now, draft.id);
+        .run(JSON.stringify(finalFields), now, draft.id);
     }
 
-    // Also cache raw parse for debugging
-    db.prepare("INSERT OR REPLACE INTO cache (hash, text, parsed, created_at) VALUES (?, ?, ?, ?)")
-      .run(hash, text, JSON.stringify(fields), now);
+    // Cache raw parse + LLM json
+    db.prepare("INSERT OR REPLACE INTO cache (hash, text, parsed, created_at, llm_json) VALUES (?, ?, ?, ?, ?)")
+      .run(hash, textBest, JSON.stringify(seedFields), now, llmJson);
 
-    res.json({ ...fields, draft_id: draft.id, version_no: draft.version_no, status: "draft" });
+    res.json({ ...finalFields, draft_id: draft.id, version_no: draft.version_no, status: "draft" });
   } catch (err) {
     console.error("Upload failed:", err);
     res.status(500).json({ error: "Server error: " + (err.message || "unknown") });
@@ -1280,4 +1482,4 @@ app.get("/api/shipments.csv", (_req, res) => {
 
 // ---------- Start ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Listening on :" + PORT));
+app.listen(PORT, () => console.log("Listening on :" + PORT + (useOpenAI ? " (OpenAI refine ON)" : " (OpenAI refine OFF)")));
