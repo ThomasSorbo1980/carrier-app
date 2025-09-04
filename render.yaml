@@ -1,12 +1,8 @@
 services:
   - type: web
     name: carrier-app
-    env: docker
+    env: node
     plan: starter
-    envVars:
-      - key: SQLITE_DB_PATH
-        value: /data/shipments.db
-    disk:
-      name: data
-      mountPath: /data
-      sizeGB: 1
+    buildCommand: "npm ci"
+    startCommand: "npm start"
+    healthCheckPath: /api/health
